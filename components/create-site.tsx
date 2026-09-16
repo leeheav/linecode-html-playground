@@ -85,6 +85,7 @@ export function CreateSite() {
               您的网站将在以下地址可用: {" "}
               <span className="text-purple-400">play.linecode.top/{siteName || "[random-name]"}</span>
             </p>
+            <p className="mt-1 text-sm text-amber-400">公开链接自创建起 7 天内有效。</p>
           </div>
 
           <div>

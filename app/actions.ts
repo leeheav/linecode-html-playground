@@ -1,7 +1,5 @@
 "use server"
 
-import fs from "fs/promises"
-import path from "path"
 import { parse } from "node-html-parser"
 import {
   clearAdminSession,
@@ -12,9 +10,15 @@ import {
   resetLoginFailures,
   validateAdminCredentials,
 } from "@/lib/admin-auth"
-
-// HTML文件存储目录
-const SITES_DIR = path.join(process.cwd(), "public", "sites")
+import {
+  createStoredSite,
+  deleteStoredSite,
+  isSiteNameTaken,
+  isValidSiteName,
+  listStoredSites,
+  readStoredSite,
+  renameStoredSite,
+} from "@/lib/site-storage"
 
 /**
  * 生成随机字母数字名称，长度在6-9个字符之间
@@ -45,29 +49,6 @@ function validateHtml(html: string): { valid: boolean; error?: string } {
     return { valid: true }
   } catch (error) {
     return { valid: false, error: "HTML结构无效。请检查代码语法错误。" }
-  }
-}
-
-/**
- * 确保站点目录存在
- */
-async function ensureSitesDirectory(): Promise<void> {
-  try {
-    await fs.access(SITES_DIR)
-  } catch (error) {
-    await fs.mkdir(SITES_DIR, { recursive: true })
-  }
-}
-
-/**
- * 检查站点名称是否已被占用
- */
-async function isSiteNameTaken(name: string): Promise<boolean> {
-  try {
-    await fs.access(path.join(SITES_DIR, `${name}.html`))
-    return true
-  } catch (error) {
-    return false
   }
 }
 
@@ -109,32 +90,27 @@ export async function createSite(
   // 使用处理后的安全 HTML
   const safeHtml = root.toString()
 
-  await ensureSitesDirectory()
-
   // 2. 名称处理逻辑
   let finalSiteName = siteName.trim()
   let isGenerated = false
 
-  if (!finalSiteName) {
-    do { finalSiteName = generateRandomName() } while (await isSiteNameTaken(finalSiteName))
-    isGenerated = true
-  } else {
-    if (await isSiteNameTaken(finalSiteName)) {
-      do { finalSiteName = generateRandomName() } while (await isSiteNameTaken(finalSiteName))
-      isGenerated = true
-    } else {
-      if (!/^[a-zA-Z0-9_-]+$/.test(finalSiteName)) {
-        return { url: "", error: "站点名称只能包含字母、数字、连字符和下划线。" }
-      }
-    }
+  if (finalSiteName && !isValidSiteName(finalSiteName)) {
+    return { url: "", error: "站点名称只能包含字母、数字、连字符和下划线。" }
   }
 
   try {
-    const filePath = path.join(SITES_DIR, `${finalSiteName}.html`)
-    // 写入 safeHtml
-    await fs.writeFile(filePath, safeHtml, "utf-8")
+    if (!finalSiteName || (await isSiteNameTaken(finalSiteName))) {
+      isGenerated = true
+      finalSiteName = generateRandomName()
+    }
 
-    const baseUrl = 'http://play.linecode.top' // 您的域名
+    // 独占创建，避免并发请求生成相同名称时互相覆盖。
+    while (!(await createStoredSite(finalSiteName, safeHtml))) {
+      isGenerated = true
+      finalSiteName = generateRandomName()
+    }
+
+    const baseUrl = (process.env.NEXT_PUBLIC_BASE_URL || "https://play.linecode.top").replace(/\/$/, "")
     const url = `${baseUrl}/${finalSiteName}`
 
     return {
@@ -190,8 +166,9 @@ export async function checkAdminSession(): Promise<boolean> {
 
 export interface Site {
   name: string
-  html: string
   createdAt: Date
+  expiresAt: Date
+  expired: boolean
 }
 
 /**
@@ -207,31 +184,13 @@ export async function getAllSites(): Promise<{
   }
 
   try {
-    await ensureSitesDirectory()
-    const files = await fs.readdir(SITES_DIR)
-    const htmlFiles = files.filter(file => file.endsWith('.html'))
-
-    const sitePromises = htmlFiles.map(async (file) => {
-      try {
-        const filePath = path.join(SITES_DIR, file)
-        const [html, stats] = await Promise.all([
-          fs.readFile(filePath, 'utf-8'),
-          fs.stat(filePath)
-        ])
-        return {
-          name: file.replace(/\.html$/, ''),
-          html: html.substring(0, 200), // 只读前200字符用于预览，节省性能
-          createdAt: stats.birthtime || stats.ctime
-        }
-      } catch (error) {
-        return null
-      }
-    })
-
-    const results = await Promise.all(sitePromises)
     return {
-      sites: results.filter((site): site is Site => site !== null)
-        .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime()),
+      sites: (await listStoredSites()).map((site) => ({
+        name: site.name,
+        createdAt: site.createdAt,
+        expiresAt: site.expiresAt,
+        expired: site.expired,
+      })),
     }
   } catch (error) {
     console.error(error)
@@ -248,12 +207,12 @@ export async function deleteSite(siteName: string): Promise<{ success: boolean; 
   }
 
   try {
-    if (!/^[a-zA-Z0-9_-]+$/.test(siteName)) {
+    if (!isValidSiteName(siteName)) {
       return { success: false, error: "站点名称格式无效" }
     }
-    await ensureSitesDirectory()
-    const filePath = path.join(SITES_DIR, `${siteName}.html`)
-    await fs.unlink(filePath)
+    if (!(await deleteStoredSite(siteName))) {
+      return { success: false, error: "站点不存在" }
+    }
     return { success: true }
   } catch (error) {
     return { success: false, error: "删除失败" }
@@ -269,25 +228,41 @@ export async function renameSite(oldName: string, newName: string): Promise<{ su
   }
 
   try {
-    if (!/^[a-zA-Z0-9_-]+$/.test(oldName) || !/^[a-zA-Z0-9_-]+$/.test(newName)) {
+    if (!isValidSiteName(oldName) || !isValidSiteName(newName)) {
       return { success: false, error: "名称格式无效" }
     }
     if (oldName === newName) return { success: false, error: "名称相同" }
 
-    await ensureSitesDirectory()
-    const oldFilePath = path.join(SITES_DIR, `${oldName}.html`)
-    const newFilePath = path.join(SITES_DIR, `${newName}.html`)
-
-    // 检查是否存在
-    try { await fs.access(oldFilePath) } catch { return { success: false, error: "原站点不存在" } }
-    try {
-        await fs.access(newFilePath)
-        return { success: false, error: "新名称已被占用" }
-    } catch { } // 新文件不存在才正常
-
-    await fs.rename(oldFilePath, newFilePath)
+    if (!(await readStoredSite(oldName))) return { success: false, error: "原站点不存在" }
+    if (await isSiteNameTaken(newName)) return { success: false, error: "新名称已被占用" }
+    if (!(await renameStoredSite(oldName, newName))) {
+      return { success: false, error: "重命名失败" }
+    }
     return { success: true }
   } catch (error) {
     return { success: false, error: "重命名失败" }
+  }
+}
+
+/**
+ * 后台预览站点。即使公开链接已过期，管理员仍可读取原始文件。
+ */
+export async function getSiteHtmlForAdmin(siteName: string): Promise<{
+  html?: string
+  error?: string
+  unauthorized?: boolean
+}> {
+  if (!(await isAdminAuthenticated())) {
+    return { unauthorized: true, error: "未登录或会话已过期" }
+  }
+  if (!isValidSiteName(siteName)) return { error: "站点名称格式无效" }
+
+  try {
+    const site = await readStoredSite(siteName)
+    if (!site) return { error: "站点不存在" }
+    return { html: site.html }
+  } catch (error) {
+    console.error(error)
+    return { error: "读取站点失败" }
   }
 }

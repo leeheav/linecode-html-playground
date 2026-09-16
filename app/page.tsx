@@ -10,7 +10,7 @@ export default function HomePage() {
             HTML Playground
           </h1>
           <p className="text-gray-400 max-w-2xl mx-auto">
-            粘贴你的 HTML 代码，给它取个名字（或者让我们为你生成一个），然后立即在 play.linecode.top/你的名字 获得一个可分享的 URL
+            粘贴你的 HTML 代码，给它取个名字（或者让我们为你生成一个），立即获得一个有效期为 7 天的可分享 URL。到期后文件仍会保留，仅管理员可在后台查看。
           </p>
         </div>
 

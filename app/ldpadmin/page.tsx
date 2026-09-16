@@ -10,6 +10,7 @@ import {
   checkAdminSession,
   deleteSite,
   getAllSites,
+  getSiteHtmlForAdmin,
   renameSite,
 } from "@/app/actions"
 import { Button } from "@/components/ui/button"
@@ -22,8 +23,9 @@ import { Alert, AlertDescription } from "@/components/ui/alert"
 
 interface Site {
   name: string
-  html: string
   createdAt: Date
+  expiresAt: Date
+  expired: boolean
 }
 
 export default function AdminPage() {
@@ -38,6 +40,9 @@ export default function AdminPage() {
   const [editingName, setEditingName] = useState<string | null>(null)
   const [newName, setNewName] = useState("")
   const [error, setError] = useState("")
+  const [previewName, setPreviewName] = useState<string | null>(null)
+  const [previewHtml, setPreviewHtml] = useState("")
+  const [isPreviewLoading, setIsPreviewLoading] = useState(false)
   const [currentPage, setCurrentPage] = useState(1)
   const [itemsPerPage] = useState(10)
 
@@ -130,8 +135,27 @@ export default function AdminPage() {
     }
   }
 
-  const handleView = (siteName: string) => {
-    window.open(`/${siteName}`, "_blank")
+  const handleView = async (siteName: string) => {
+    setError("")
+    setPreviewName(siteName)
+    setPreviewHtml("")
+    setIsPreviewLoading(true)
+    const result = await getSiteHtmlForAdmin(siteName)
+    setIsPreviewLoading(false)
+
+    if (result.unauthorized) {
+      setPreviewName(null)
+      setIsAuthenticated(false)
+      setSites([])
+      setLoginError(result.error || "会话已过期，请重新登录")
+      return
+    }
+    if (!result.html) {
+      setPreviewName(null)
+      setError(result.error || "读取站点失败")
+      return
+    }
+    setPreviewHtml(result.html)
   }
 
   const handleLogout = async () => {
@@ -242,19 +266,20 @@ export default function AdminPage() {
                 <TableRow className="border-gray-800 hover:bg-gray-800/50">
                   <TableHead className="text-gray-300">名称</TableHead>
                   <TableHead className="text-gray-300">创建时间</TableHead>
+                  <TableHead className="text-gray-300">公开状态</TableHead>
                   <TableHead className="text-gray-300 text-right">操作</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {isLoading ? (
                   <TableRow>
-                    <TableCell colSpan={3} className="text-center text-gray-400">
+                    <TableCell colSpan={4} className="text-center text-gray-400">
                       加载中...
                     </TableCell>
                   </TableRow>
                 ) : currentSites.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={3} className="text-center text-gray-400">
+                    <TableCell colSpan={4} className="text-center text-gray-400">
                       暂无站点
                     </TableCell>
                   </TableRow>
@@ -263,12 +288,20 @@ export default function AdminPage() {
                     <TableRow key={site.name} className="border-gray-800 hover:bg-gray-800/50">
                       <TableCell className="font-medium text-white">{site.name}</TableCell>
                       <TableCell className="text-gray-400">{formatDate(site.createdAt)}</TableCell>
+                      <TableCell>
+                        {site.expired ? (
+                          <span className="text-red-400">已过期（文件保留）</span>
+                        ) : (
+                          <span className="text-green-400">有效至 {formatDate(site.expiresAt)}</span>
+                        )}
+                      </TableCell>
                       <TableCell className="text-right">
                         <div className="flex justify-end gap-2">
                           <Button
                             size="sm"
                             variant="ghost"
                             onClick={() => handleView(site.name)}
+                            aria-label={`预览 ${site.name}`}
                             className="text-blue-400 hover:text-blue-300 hover:bg-gray-800"
                           >
                             <Eye className="h-4 w-4" />
@@ -390,6 +423,32 @@ export default function AdminPage() {
                 确认
               </Button>
             </DialogFooter>
+          </DialogContent>
+        </Dialog>
+
+        <Dialog open={previewName !== null} onOpenChange={(open) => !open && setPreviewName(null)}>
+          <DialogContent className="max-w-6xl h-[88vh] bg-gray-900 border-gray-800 text-white flex flex-col">
+            <DialogHeader>
+              <DialogTitle>
+                后台安全预览：{previewName}
+              </DialogTitle>
+            </DialogHeader>
+            <p className="text-sm text-gray-400">
+              预览在受限沙箱中运行，公开链接过期后仍可在这里查看。
+            </p>
+            <div className="flex-1 min-h-0 rounded-md overflow-hidden bg-white">
+              {isPreviewLoading ? (
+                <div className="h-full grid place-items-center text-gray-600">正在加载...</div>
+              ) : (
+                <iframe
+                  title={`站点 ${previewName || ""} 的后台预览`}
+                  srcDoc={previewHtml}
+                  sandbox="allow-scripts"
+                  referrerPolicy="no-referrer"
+                  className="w-full h-full border-0"
+                />
+              )}
+            </div>
           </DialogContent>
         </Dialog>
       </div>

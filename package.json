@@ -6,6 +6,7 @@
     "dev": "next dev -p 3001",
     "build": "next build",
     "start": "next start -p 3001",
+    "migrate:sites": "node scripts/migrate-sites.mjs",
     "lint": "next lint"
   },
   "dependencies": {
