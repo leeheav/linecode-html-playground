@@ -4,7 +4,14 @@ import type React from "react"
 
 import { useState, useEffect } from "react"
 import { useRouter } from "next/navigation"
-import { adminLogin, getAllSites, deleteSite, renameSite } from "@/app/actions"
+import {
+  adminLogin,
+  adminLogout,
+  checkAdminSession,
+  deleteSite,
+  getAllSites,
+  renameSite,
+} from "@/app/actions"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Card } from "@/components/ui/card"
@@ -22,6 +29,7 @@ interface Site {
 export default function AdminPage() {
   const router = useRouter()
   const [isAuthenticated, setIsAuthenticated] = useState(false)
+  const [isCheckingSession, setIsCheckingSession] = useState(true)
   const [username, setUsername] = useState("")
   const [password, setPassword] = useState("")
   const [loginError, setLoginError] = useState("")
@@ -34,6 +42,22 @@ export default function AdminPage() {
   const [itemsPerPage] = useState(10)
 
   useEffect(() => {
+    let cancelled = false
+
+    checkAdminSession()
+      .then((authenticated) => {
+        if (!cancelled) setIsAuthenticated(authenticated)
+      })
+      .finally(() => {
+        if (!cancelled) setIsCheckingSession(false)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  useEffect(() => {
     if (isAuthenticated) {
       loadSites()
     }
@@ -41,8 +65,16 @@ export default function AdminPage() {
 
   const loadSites = async () => {
     setIsLoading(true)
-    const allSites = await getAllSites()
-    setSites(allSites)
+    const result = await getAllSites()
+
+    if (result.unauthorized) {
+      setIsAuthenticated(false)
+      setSites([])
+      setLoginError(result.error || "会话已过期，请重新登录")
+    } else {
+      setSites(result.sites)
+      setError(result.error || "")
+    }
     setIsLoading(false)
   }
 
@@ -67,6 +99,12 @@ export default function AdminPage() {
     if (result.success) {
       await loadSites()
     } else {
+      if (result.error === "未登录或会话已过期") {
+        setIsAuthenticated(false)
+        setSites([])
+        setLoginError(result.error)
+        return
+      }
       setError(result.error || "删除失败")
     }
   }
@@ -81,6 +119,13 @@ export default function AdminPage() {
       setNewName("")
       await loadSites()
     } else {
+      if (result.error === "未登录或会话已过期") {
+        setIsAuthenticated(false)
+        setSites([])
+        setEditingName(null)
+        setLoginError(result.error)
+        return
+      }
       setError(result.error || "重命名失败")
     }
   }
@@ -89,11 +134,21 @@ export default function AdminPage() {
     window.open(`/${siteName}`, "_blank")
   }
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
+    await adminLogout()
     setIsAuthenticated(false)
+    setSites([])
     setUsername("")
     setPassword("")
     router.push("/")
+  }
+
+  if (isCheckingSession) {
+    return (
+      <main className="min-h-screen bg-black text-white flex items-center justify-center">
+        <p className="text-gray-400">正在验证管理员会话...</p>
+      </main>
+    )
   }
 
   const formatDate = (date: Date) => {

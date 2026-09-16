@@ -13,6 +13,7 @@ try {
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  poweredByHeader: false,
   eslint: {
     ignoreDuringBuilds: true,
   },
@@ -26,6 +27,21 @@ const nextConfig = {
     webpackBuildWorker: true,
     parallelServerBuildTraces: true,
     parallelServerCompiles: true,
+  },
+  async headers() {
+    return [
+      {
+        source: '/ldpadmin',
+        headers: [
+          { key: 'Cache-Control', value: 'private, no-store' },
+          { key: 'Content-Security-Policy', value: "frame-ancestors 'none'; base-uri 'none'; form-action 'self';" },
+          { key: 'Cross-Origin-Opener-Policy', value: 'same-origin' },
+          { key: 'Referrer-Policy', value: 'no-referrer' },
+          { key: 'X-Content-Type-Options', value: 'nosniff' },
+          { key: 'X-Frame-Options', value: 'DENY' },
+        ],
+      },
+    ]
   },
 }
 

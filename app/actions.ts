@@ -3,6 +3,15 @@
 import fs from "fs/promises"
 import path from "path"
 import { parse } from "node-html-parser"
+import {
+  clearAdminSession,
+  createAdminSession,
+  getLoginRetryAfterSeconds,
+  isAdminAuthenticated,
+  recordLoginFailure,
+  resetLoginFailures,
+  validateAdminCredentials,
+} from "@/lib/admin-auth"
 
 // HTML文件存储目录
 const SITES_DIR = path.join(process.cwd(), "public", "sites")
@@ -140,13 +149,43 @@ export async function createSite(
 
 // --- 以下是丢失的 Admin 管理功能 ---
 
-export async function adminLogin(formData: FormData): Promise<{ success: boolean; error?: string }> {
-  const password = formData.get('password') as string;
-  // 简单鉴权
-  if (password === "ldp123456789..") {
-    return { success: true }
+export async function adminLogin(
+  username: string,
+  password: string,
+): Promise<{ success: boolean; error?: string }> {
+  const retryAfter = await getLoginRetryAfterSeconds()
+  if (retryAfter > 0) {
+    return {
+      success: false,
+      error: `登录尝试过于频繁，请在 ${Math.ceil(retryAfter / 60)} 分钟后重试`,
+    }
   }
-  return { success: false, error: "密码错误" }
+
+  if (!validateAdminCredentials(username, password)) {
+    const blockedFor = await recordLoginFailure()
+    return {
+      success: false,
+      error:
+        blockedFor > 0
+          ? "登录失败次数过多，请在 15 分钟后重试"
+          : "用户名或密码错误",
+    }
+  }
+
+  await resetLoginFailures()
+  if (!(await createAdminSession())) {
+    return { success: false, error: "管理员认证未正确配置" }
+  }
+
+  return { success: true }
+}
+
+export async function adminLogout(): Promise<void> {
+  await clearAdminSession()
+}
+
+export async function checkAdminSession(): Promise<boolean> {
+  return isAdminAuthenticated()
 }
 
 export interface Site {
@@ -158,7 +197,15 @@ export interface Site {
 /**
  * 获取所有站点的信息
  */
-export async function getAllSites(): Promise<Site[]> {
+export async function getAllSites(): Promise<{
+  sites: Site[]
+  unauthorized?: boolean
+  error?: string
+}> {
+  if (!(await isAdminAuthenticated())) {
+    return { sites: [], unauthorized: true, error: "未登录或会话已过期" }
+  }
+
   try {
     await ensureSitesDirectory()
     const files = await fs.readdir(SITES_DIR)
@@ -182,11 +229,13 @@ export async function getAllSites(): Promise<Site[]> {
     })
 
     const results = await Promise.all(sitePromises)
-    return results.filter((site): site is Site => site !== null)
-      .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
+    return {
+      sites: results.filter((site): site is Site => site !== null)
+        .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime()),
+    }
   } catch (error) {
     console.error(error)
-    return []
+    return { sites: [], error: "加载站点失败" }
   }
 }
 
@@ -194,6 +243,10 @@ export async function getAllSites(): Promise<Site[]> {
  * 删除站点
  */
 export async function deleteSite(siteName: string): Promise<{ success: boolean; error?: string }> {
+  if (!(await isAdminAuthenticated())) {
+    return { success: false, error: "未登录或会话已过期" }
+  }
+
   try {
     if (!/^[a-zA-Z0-9_-]+$/.test(siteName)) {
       return { success: false, error: "站点名称格式无效" }
@@ -211,6 +264,10 @@ export async function deleteSite(siteName: string): Promise<{ success: boolean; 
  * 重命名站点
  */
 export async function renameSite(oldName: string, newName: string): Promise<{ success: boolean; error?: string }> {
+  if (!(await isAdminAuthenticated())) {
+    return { success: false, error: "未登录或会话已过期" }
+  }
+
   try {
     if (!/^[a-zA-Z0-9_-]+$/.test(oldName) || !/^[a-zA-Z0-9_-]+$/.test(newName)) {
       return { success: false, error: "名称格式无效" }
