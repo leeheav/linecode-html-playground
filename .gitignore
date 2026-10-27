@@ -29,3 +29,10 @@ pnpm-lock.yaml
 # Generated sites are runtime data, not source files.
 /data/sites/*
 !/data/sites/.gitkeep
+
+# Deployment configuration and generated backup files.
+/.env
+/.env.*
+!/.env.example
+/.next.*/
+/.deployment-backups/

@@ -64,4 +64,6 @@ if (userConfig) {
   }
 }
 
+nextConfig.output = "standalone"
+
 export default nextConfig

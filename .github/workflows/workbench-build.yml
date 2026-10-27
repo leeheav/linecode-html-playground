@@ -1,0 +1,59 @@
+# Review this workflow before committing. It only produces a candidate release.
+# Adapt build commands and the static output directory to this repository.
+name: Workbench build
+run-name: workbench-${{ inputs.workbench_build_id || github.sha }}
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+    inputs:
+      workbench_build_id:
+        description: Workbench correlation ID; leave empty for a manual candidate
+        required: false
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: workbench-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      APP_ID: de60514f-a192-41de-be55-f167c6a51d7c
+      BUILD_ID: ${{ inputs.workbench_build_id }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6.1.0
+        with:
+          persist-credentials: false
+      - name: Build and push fixed Linux image
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GHCR_USER" --password-stdin
+          docker buildx build --platform linux/amd64 --push --provenance=false --metadata-file image-metadata.json --tag "$image:$GITHUB_SHA" .
+          export IMAGE="$image"
+          python3 - <<'PY'
+          import json, os, pathlib, re
+          digest = json.loads(pathlib.Path('image-metadata.json').read_text())['containerimage.digest']
+          assert re.fullmatch(r'sha256:[a-f0-9]{64}', digest)
+          manifest = dict(application_id=os.environ['APP_ID'], kind='container', commit_sha=os.environ['GITHUB_SHA'], build_id=os.environ.get('BUILD_ID', ''), image=os.environ['IMAGE']+'@'+digest)
+          pathlib.Path('workbench-release.json').write_text(json.dumps(manifest))
+          PY
+      - name: Remove registry credentials
+        if: always()
+        run: docker logout ghcr.io
+      - uses: actions/upload-artifact@v6.0.0
+        with:
+          name: workbench-release-de60514f-a192-41de-be55-f167c6a51d7c
+          path: |
+            workbench-release.json
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
