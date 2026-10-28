@@ -1,6 +1,7 @@
 import { constants } from "node:fs"
 import { access, stat } from "node:fs/promises"
 import path from "node:path"
+import { publicSiteUrl } from "@/lib/site-url"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
@@ -9,6 +10,7 @@ const headers = { "Cache-Control": "no-store" }
 
 export async function GET() {
   try {
+    publicSiteUrl("configuration-check")
     const directory = process.env.SITES_DIR || ""
     if (
       !process.env.ADMIN_USERNAME?.trim() ||

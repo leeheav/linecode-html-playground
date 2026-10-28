@@ -27,6 +27,8 @@ ENV NODE_ENV=production \
     NEXT_TELEMETRY_DISABLED=1 \
     HOSTNAME=0.0.0.0 \
     PORT=3001 \
+    HOME=/tmp \
+    XDG_CACHE_HOME=/tmp/.cache \
     SITES_DIR=/data/sites
 RUN groupadd --gid 10001 nextjs \
     && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin nextjs \
@@ -40,4 +42,5 @@ RUN rm -rf /app/.next/cache \
     && ln -s /tmp/next-cache /app/.next/cache
 USER 10001:10001
 EXPOSE 3001
+STOPSIGNAL SIGTERM
 CMD ["sh", "-c", "mkdir -p /tmp/next-cache && exec node server.js"]

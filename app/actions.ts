@@ -1,6 +1,5 @@
 "use server"
 
-import { parse } from "node-html-parser"
 import {
   clearAdminSession,
   createAdminSession,
@@ -11,7 +10,6 @@ import {
   validateAdminCredentials,
 } from "@/lib/admin-auth"
 import {
-  createStoredSite,
   deleteStoredSite,
   isSiteNameTaken,
   isValidSiteName,
@@ -19,107 +17,42 @@ import {
   readStoredSite,
   renameStoredSite,
 } from "@/lib/site-storage"
+import {
+  createSiteFromInput,
+  checkCreateRateLimit,
+  getSite,
+  listSites,
+  purgeSite as purgeStoredSiteV2,
+  readSiteFileForAdmin,
+  renameSiteRecord,
+  setSiteDisabled,
+  setSiteExpiry,
+  setSiteStatus,
+  SiteInputError,
+} from "@/lib/site-service"
+import { publicSiteUrl } from "@/lib/site-url"
 
-/**
- * 生成随机字母数字名称，长度在6-9个字符之间
- */
-function generateRandomName(): string {
-  const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-  const length = Math.floor(Math.random() * 4) + 6 // 6-9
-  let result = ""
-  for (let i = 0; i < length; i++) {
-    result += chars.charAt(Math.floor(Math.random() * chars.length))
-  }
-  return result
-}
-
-/**
- * 验证HTML内容
- */
-function validateHtml(html: string): { valid: boolean; error?: string } {
-  try {
-    const root = parse(html)
-    // 检查基本结构
-    if (!html.includes("<html") || !html.includes("</html>")) {
-      return { valid: false, error: "HTML必须包含<html>标签" }
-    }
-    if (!html.includes("<body") || !html.includes("</body>")) {
-      return { valid: false, error: "HTML必须包含<body>标签" }
-    }
-    return { valid: true }
-  } catch (error) {
-    return { valid: false, error: "HTML结构无效。请检查代码语法错误。" }
-  }
-}
-
-/**
- * 创建HTML站点 (包含安全增强)
- */
 export async function createSite(
   html: string,
   siteName: string,
 ): Promise<{ url: string; generatedName?: string; error?: string }> {
-  // 1. 验证HTML
-  const validation = validateHtml(html)
-  if (!validation.valid) {
-    return { url: "", error: validation.error }
-  }
-
-  // ★★★ 安全增强：注入防钓鱼警示横幅 ★★★
-  const root = parse(html)
-  const body = root.querySelector('body')
-
-  if (body) {
-    const securityBanner = `
-      <div style="
-        position: fixed;
-        top: 0; left: 0; width: 100%;
-        background-color: #ef4444; color: white;
-        text-align: center; padding: 12px;
-        z-index: 9999999; font-family: sans-serif; font-weight: bold;
-        box-shadow: 0 2px 10px rgba(0,0,0,0.3);
-      ">
-        ⚠️ 警告：此页面由用户生成。请勿输入密码或下载文件！
-      </div>
-      <div style="height: 48px;"></div>
-    `
-    // 在 body 最前面插入
-    // body.insertAdjacentHTML('afterbegin', securityBanner)
-  }
-
-  // 使用处理后的安全 HTML
-  const safeHtml = root.toString()
-
-  // 2. 名称处理逻辑
-  let finalSiteName = siteName.trim()
-  let isGenerated = false
-
-  if (finalSiteName && !isValidSiteName(finalSiteName)) {
-    return { url: "", error: "站点名称只能包含字母、数字、连字符和下划线。" }
-  }
-
   try {
-    if (!finalSiteName || (await isSiteNameTaken(finalSiteName))) {
-      isGenerated = true
-      finalSiteName = generateRandomName()
+    publicSiteUrl("configuration-check")
+    if (!checkCreateRateLimit("legacy-action")) {
+      return { url: "", error: "创建过于频繁，请稍后重试。" }
     }
-
-    // 独占创建，避免并发请求生成相同名称时互相覆盖。
-    while (!(await createStoredSite(finalSiteName, safeHtml))) {
-      isGenerated = true
-      finalSiteName = generateRandomName()
+    const { site, generatedName } = await createSiteFromInput({ html, name: siteName })
+    if (site.status !== "active") {
+      return { url: "", error: "内容已提交审核，审核通过后才会公开。" }
     }
-
-    const baseUrl = (process.env.NEXT_PUBLIC_BASE_URL || "https://play.linecode.top").replace(/\/$/, "")
-    const url = `${baseUrl}/${finalSiteName}`
-
     return {
-      url,
-      ...(isGenerated && { generatedName: finalSiteName }),
+      url: publicSiteUrl(site.name),
+      ...(generatedName && { generatedName: site.name }),
     }
   } catch (error) {
+    if (error instanceof SiteInputError) return { url: "", error: error.message }
     console.error(error)
-    return { url: "", error: "保存文件时发生错误。" }
+    return { url: "", error: "创建站点时发生错误。" }
   }
 }
 
@@ -169,6 +102,10 @@ export interface Site {
   createdAt: Date
   expiresAt: Date
   expired: boolean
+  version: 1 | 2
+  status: "active" | "review" | "disabled" | "rejected"
+  inputType?: "html" | "file" | "zip"
+  findings?: string[]
 }
 
 /**
@@ -184,13 +121,28 @@ export async function getAllSites(): Promise<{
   }
 
   try {
+    const [legacy, current] = await Promise.all([listStoredSites(), listSites()])
     return {
-      sites: (await listStoredSites()).map((site) => ({
-        name: site.name,
-        createdAt: site.createdAt,
-        expiresAt: site.expiresAt,
-        expired: site.expired,
-      })),
+      sites: [
+        ...current.map((site) => ({
+          name: site.name,
+          createdAt: new Date(site.createdAt),
+          expiresAt: new Date(site.expiresAt),
+          expired: Date.now() >= Date.parse(site.expiresAt),
+          version: 2 as const,
+          status: site.status,
+          inputType: site.inputType,
+          findings: site.scan.findings.map((finding) => finding.message),
+        })),
+        ...legacy.map((site) => ({
+          name: site.name,
+          createdAt: site.createdAt,
+          expiresAt: site.expiresAt,
+          expired: site.expired,
+          version: 1 as const,
+          status: "active" as const,
+        })),
+      ].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime()),
     }
   } catch (error) {
     console.error(error)
@@ -210,11 +162,16 @@ export async function deleteSite(siteName: string): Promise<{ success: boolean; 
     if (!isValidSiteName(siteName)) {
       return { success: false, error: "站点名称格式无效" }
     }
+    if (await getSite(siteName)) {
+      return (await setSiteDisabled(siteName, true))
+        ? { success: true }
+        : { success: false, error: "站点不存在或无法下线" }
+    }
     if (!(await deleteStoredSite(siteName))) {
       return { success: false, error: "站点不存在" }
     }
     return { success: true }
-  } catch (error) {
+  } catch {
     return { success: false, error: "删除失败" }
   }
 }
@@ -232,6 +189,11 @@ export async function renameSite(oldName: string, newName: string): Promise<{ su
       return { success: false, error: "名称格式无效" }
     }
     if (oldName === newName) return { success: false, error: "名称相同" }
+    if (await getSite(oldName)) {
+      return (await renameSiteRecord(oldName, newName))
+        ? { success: true }
+        : { success: false, error: "新名称已被占用或站点不存在" }
+    }
 
     if (!(await readStoredSite(oldName))) return { success: false, error: "原站点不存在" }
     if (await isSiteNameTaken(newName)) return { success: false, error: "新名称已被占用" }
@@ -239,7 +201,7 @@ export async function renameSite(oldName: string, newName: string): Promise<{ su
       return { success: false, error: "重命名失败" }
     }
     return { success: true }
-  } catch (error) {
+  } catch {
     return { success: false, error: "重命名失败" }
   }
 }
@@ -258,11 +220,58 @@ export async function getSiteHtmlForAdmin(siteName: string): Promise<{
   if (!isValidSiteName(siteName)) return { error: "站点名称格式无效" }
 
   try {
+    if (await getSite(siteName)) {
+      const file = await readSiteFileForAdmin(siteName)
+      return file ? { html: file.body.toString("utf8") } : { error: "站点入口文件不存在" }
+    }
     const site = await readStoredSite(siteName)
     if (!site) return { error: "站点不存在" }
     return { html: site.html }
   } catch (error) {
     console.error(error)
     return { error: "读取站点失败" }
+  }
+}
+
+export async function approveSite(siteName: string): Promise<{ success: boolean; error?: string }> {
+  if (!(await isAdminAuthenticated())) return { success: false, error: "未登录或会话已过期" }
+  const site = await getSite(siteName)
+  if (!site || site.status !== "review") return { success: false, error: "站点不在待审核状态" }
+  if (Date.now() >= Date.parse(site.expiresAt)) return { success: false, error: "站点已过期，请先延长有效期" }
+  return (await setSiteStatus(siteName, "active"))
+    ? { success: true }
+    : { success: false, error: "审核操作失败" }
+}
+
+export async function restoreSite(siteName: string): Promise<{ success: boolean; error?: string }> {
+  if (!(await isAdminAuthenticated())) return { success: false, error: "未登录或会话已过期" }
+  const site = await getSite(siteName)
+  if (!site || site.status !== "disabled") return { success: false, error: "站点未下线" }
+  if (Date.now() >= Date.parse(site.expiresAt)) return { success: false, error: "站点已过期，请先延长有效期" }
+  return (await setSiteDisabled(siteName, false))
+    ? { success: true }
+    : { success: false, error: "恢复失败" }
+}
+
+export async function changeSiteExpiry(siteName: string, expiresInHours: number): Promise<{ success: boolean; error?: string }> {
+  if (!(await isAdminAuthenticated())) return { success: false, error: "未登录或会话已过期" }
+  if (![1, 24, 72, 168, 720].includes(expiresInHours)) return { success: false, error: "有效期选项无效" }
+  try {
+    return (await setSiteExpiry(siteName, new Date(Date.now() + expiresInHours * 3600_000).toISOString()))
+      ? { success: true }
+      : { success: false, error: "站点不存在" }
+  } catch (error) {
+    return { success: false, error: error instanceof SiteInputError ? error.message : "修改有效期失败" }
+  }
+}
+
+export async function purgeSiteForAdmin(siteName: string): Promise<{ success: boolean; error?: string }> {
+  if (!(await isAdminAuthenticated())) return { success: false, error: "未登录或会话已过期" }
+  try {
+    return (await purgeStoredSiteV2(siteName))
+      ? { success: true }
+      : { success: false, error: "站点不存在" }
+  } catch {
+    return { success: false, error: "彻底清除失败" }
   }
 }

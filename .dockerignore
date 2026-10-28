@@ -2,10 +2,14 @@
 .github
 .next
 .next.*
+.vercel
 node_modules
 out
 build
 dist
+coverage
+test-results
+playwright-report
 .deployment-backups
 .env
 .env.*
@@ -17,4 +21,5 @@ dist
 *.log
 *.tsbuildinfo
 data
+tmp
 public/sites

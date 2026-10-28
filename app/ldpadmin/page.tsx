@@ -2,16 +2,20 @@
 
 import type React from "react"
 
-import { useState, useEffect } from "react"
+import { useState, useEffect, useCallback } from "react"
 import { useRouter } from "next/navigation"
 import {
   adminLogin,
   adminLogout,
+  approveSite,
+  changeSiteExpiry,
   checkAdminSession,
   deleteSite,
   getAllSites,
   getSiteHtmlForAdmin,
+  purgeSiteForAdmin,
   renameSite,
+  restoreSite,
 } from "@/app/actions"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -26,6 +30,10 @@ interface Site {
   createdAt: Date
   expiresAt: Date
   expired: boolean
+  version: 1 | 2
+  status: "active" | "review" | "disabled" | "rejected"
+  inputType?: "html" | "file" | "zip"
+  findings?: string[]
 }
 
 export default function AdminPage() {
@@ -46,6 +54,26 @@ export default function AdminPage() {
   const [currentPage, setCurrentPage] = useState(1)
   const [itemsPerPage] = useState(10)
 
+  const loadSites = useCallback(async () => {
+    setIsLoading(true)
+    try {
+      const result = await getAllSites()
+      if (result.unauthorized) {
+        setIsAuthenticated(false)
+        setSites([])
+        setLoginError(result.error || "会话已过期，请重新登录")
+      } else {
+        setSites(result.sites)
+        setCurrentPage((page) => Math.min(page, Math.max(1, Math.ceil(result.sites.length / itemsPerPage))))
+        setError(result.error || "")
+      }
+    } catch {
+      setError("加载站点失败")
+    } finally {
+      setIsLoading(false)
+    }
+  }, [itemsPerPage])
+
   useEffect(() => {
     let cancelled = false
 
@@ -64,24 +92,9 @@ export default function AdminPage() {
 
   useEffect(() => {
     if (isAuthenticated) {
-      loadSites()
+      void loadSites()
     }
-  }, [isAuthenticated])
-
-  const loadSites = async () => {
-    setIsLoading(true)
-    const result = await getAllSites()
-
-    if (result.unauthorized) {
-      setIsAuthenticated(false)
-      setSites([])
-      setLoginError(result.error || "会话已过期，请重新登录")
-    } else {
-      setSites(result.sites)
-      setError(result.error || "")
-    }
-    setIsLoading(false)
-  }
+  }, [isAuthenticated, loadSites])
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -95,12 +108,15 @@ export default function AdminPage() {
     }
   }
 
-  const handleDelete = async (siteName: string) => {
-    if (!confirm(`确定要删除站点 "${siteName}" 吗？`)) {
+  const handleDelete = async (site: Site) => {
+    const prompt = site.version === 2
+      ? `确定下线站点 "${site.name}" 吗？公开链接会立即失效，后台仍保留文件。`
+      : `旧版站点 "${site.name}" 不支持下线归档。确定永久删除吗？`
+    if (!confirm(prompt)) {
       return
     }
 
-    const result = await deleteSite(siteName)
+    const result = await deleteSite(site.name)
     if (result.success) {
       await loadSites()
     } else {
@@ -112,6 +128,22 @@ export default function AdminPage() {
       }
       setError(result.error || "删除失败")
     }
+  }
+
+  const handleSiteAction = async (action: () => Promise<{ success: boolean; error?: string }>) => {
+    setError("")
+    try {
+      const result = await action()
+      if (result.success) await loadSites()
+      else setError(result.error || "操作失败")
+    } catch {
+      setError("操作失败，请重试")
+    }
+  }
+
+  const handlePurge = async (site: Site) => {
+    if (!confirm(`确定彻底清除站点 "${site.name}" 及全部文件吗？此操作不可恢复。`)) return
+    await handleSiteAction(() => purgeSiteForAdmin(site.name))
   }
 
   const handleRename = async () => {
@@ -289,7 +321,11 @@ export default function AdminPage() {
                       <TableCell className="font-medium text-white">{site.name}</TableCell>
                       <TableCell className="text-gray-400">{formatDate(site.createdAt)}</TableCell>
                       <TableCell>
-                        {site.expired ? (
+                        {site.status === "review" ? (
+                          <span className="text-amber-400" title={site.findings?.join("；")}>待审核：{site.findings?.join("；") || "发现风险"}</span>
+                        ) : site.status === "disabled" ? (
+                          <span className="text-gray-400">已下线（文件保留）</span>
+                        ) : site.expired ? (
                           <span className="text-red-400">已过期（文件保留）</span>
                         ) : (
                           <span className="text-green-400">有效至 {formatDate(site.expiresAt)}</span>
@@ -318,14 +354,38 @@ export default function AdminPage() {
                           >
                             <Edit2 className="h-4 w-4" />
                           </Button>
-                          <Button
-                            size="sm"
-                            variant="ghost"
-                            onClick={() => handleDelete(site.name)}
-                            className="text-red-400 hover:text-red-300 hover:bg-gray-800"
-                          >
-                            <Trash2 className="h-4 w-4" />
-                          </Button>
+                          {site.version === 2 && site.status === "review" && (
+                            <Button size="sm" variant="ghost" className="text-amber-300" onClick={() => handleSiteAction(() => approveSite(site.name))}>通过</Button>
+                          )}
+                          {site.version === 2 && site.status === "disabled" && (
+                            <Button size="sm" variant="ghost" className="text-green-300" onClick={() => handleSiteAction(() => restoreSite(site.name))}>恢复</Button>
+                          )}
+                          {site.version === 2 && (
+                            <select
+                              aria-label={`调整 ${site.name} 的有效期`}
+                              defaultValue=""
+                              className="rounded bg-gray-800 px-2 text-sm text-white"
+                              onChange={(event) => {
+                                const hours = Number(event.currentTarget.value)
+                                event.currentTarget.value = ""
+                                if (hours) void handleSiteAction(() => changeSiteExpiry(site.name, hours))
+                              }}
+                            >
+                              <option value="">调整有效期</option>
+                              <option value="24">从现在起 1 天</option>
+                              <option value="72">从现在起 3 天</option>
+                              <option value="168">从现在起 7 天</option>
+                              <option value="720">从现在起 30 天</option>
+                            </select>
+                          )}
+                          {site.status !== "disabled" && (
+                            <Button size="sm" variant="ghost" onClick={() => handleDelete(site)} className="text-red-400 hover:text-red-300 hover:bg-gray-800" aria-label={site.version === 2 ? `下线 ${site.name}` : `删除 ${site.name}`}>
+                              <Trash2 className="h-4 w-4" />
+                            </Button>
+                          )}
+                          {site.version === 2 && (site.status === "disabled" || site.expired) && (
+                            <Button size="sm" variant="ghost" className="text-red-400" onClick={() => handlePurge(site)}>彻底清除</Button>
+                          )}
                         </div>
                       </TableCell>
                     </TableRow>
