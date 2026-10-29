@@ -3,6 +3,7 @@ import "server-only"
 import { randomBytes } from "node:crypto"
 import fs from "node:fs/promises"
 import path from "node:path"
+import { DatabaseSync } from "node:sqlite"
 import { inflateRawSync } from "node:zlib"
 import { parse } from "node-html-parser"
 
@@ -27,6 +28,8 @@ export interface SiteRecord {
 }
 
 const ROOT = path.resolve(process.env.SITES_DIR || path.join(process.cwd(), "data", "sites"))
+const DB_PATH = path.resolve(process.env.SITE_DB_PATH || path.join(ROOT, "sites.db"))
+const databaseState = globalThis as typeof globalThis & { __linecodeSiteDatabase?: { path: string; db: DatabaseSync } }
 const MAX_UPLOAD = 10 * 1024 * 1024
 const MAX_UNPACKED = 30 * 1024 * 1024
 const MAX_FILE = 5 * 1024 * 1024
@@ -102,8 +105,36 @@ function metaPath(name: string): string { return path.join(dir(name), "site.json
 function filePath(name: string, file: string): string { return path.join(dir(name), "files", ...file.split("/")) }
 function missing(error: unknown): boolean { return !!error && typeof error === "object" && "code" in error && error.code === "ENOENT" }
 
+async function database(): Promise<DatabaseSync> {
+  if (databaseState.__linecodeSiteDatabase?.path === DB_PATH) return databaseState.__linecodeSiteDatabase.db
+  await fs.mkdir(path.dirname(DB_PATH), { recursive: true })
+  const db = new DatabaseSync(DB_PATH)
+  db.exec("PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; CREATE TABLE IF NOT EXISTS sites (name TEXT PRIMARY KEY, record_json TEXT NOT NULL, created_at TEXT NOT NULL, total_bytes INTEGER NOT NULL) STRICT;")
+  databaseState.__linecodeSiteDatabase = { path: DB_PATH, db }
+  return db
+}
+
+function parseSite(value: string, name: string): SiteRecord {
+  const site = JSON.parse(value) as SiteRecord
+  if (site.schemaVersion !== 2 || site.name !== name || !Array.isArray(site.files)) throw new Error("站点元数据损坏")
+  return site
+}
+
+async function saveToDatabase(site: SiteRecord): Promise<void> {
+  const db = await database()
+  db.prepare("INSERT INTO sites (name, record_json, created_at, total_bytes) VALUES (?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET record_json = excluded.record_json, created_at = excluded.created_at, total_bytes = excluded.total_bytes")
+    .run(site.name, JSON.stringify(site), site.createdAt, site.totalBytes)
+}
+
+async function deleteFromDatabase(name: string): Promise<void> {
+  const db = await database()
+  db.prepare("DELETE FROM sites WHERE name = ?").run(name)
+}
+
 async function isUnavailable(name: string): Promise<boolean> {
   if (RESERVED_NAMES.has(name.toLowerCase())) return true
+  const db = await database()
+  if (db.prepare("SELECT 1 FROM sites WHERE name = ?").get(name)) return true
   try { await fs.access(path.join(ROOT, `${name}.html`)); return true }
   catch (error) { if (!missing(error)) throw error }
   return false
@@ -264,6 +295,7 @@ export async function createSiteFromInput(input: {
         await fs.writeFile(target, body, { flag: "wx" })
       }
       await fs.writeFile(metaPath(name), JSON.stringify(site, null, 2), { flag: "wx" })
+      await saveToDatabase(site)
       return { site, generatedName }
     } catch (error) { await fs.rm(dir(name), { recursive: true, force: true }); throw error }
   }
@@ -273,18 +305,24 @@ export async function createSiteFromInput(input: {
 export async function getSite(name: string): Promise<SiteRecord | null> {
   ensureMaintenance()
   if (!isValidSiteName(name)) return null
+  const db = await database()
+  const row = db.prepare("SELECT record_json FROM sites WHERE name = ?").get(name) as { record_json: string } | undefined
+  if (row) return parseSite(row.record_json, name)
+  // Older installations remain readable until the explicit migration command runs.
   try {
-    const site = JSON.parse(await fs.readFile(metaPath(name), "utf8")) as SiteRecord
-    if (site.schemaVersion !== 2 || site.name !== name || !Array.isArray(site.files)) throw new Error("站点元数据损坏")
-    return site
+    return parseSite(await fs.readFile(metaPath(name), "utf8"), name)
   } catch (error) { if (missing(error)) return null; throw error }
 }
 
 export async function listSites(): Promise<SiteRecord[]> {
   await fs.mkdir(ROOT, { recursive: true })
+  const db = await database()
+  const rows = db.prepare("SELECT name, record_json FROM sites ORDER BY created_at DESC").all() as { name: string; record_json: string }[]
+  const sites = rows.map((row) => parseSite(row.record_json, row.name))
+  const known = new Set(sites.map((site) => site.name))
   const entries = await fs.readdir(ROOT, { withFileTypes: true })
-  const sites = await Promise.all(entries.filter((entry) => entry.isDirectory() && isValidSiteName(entry.name)).map((entry) => getSite(entry.name)))
-  return sites.filter((site): site is SiteRecord => site !== null).sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+  const oldSites = await Promise.all(entries.filter((entry) => entry.isDirectory() && isValidSiteName(entry.name) && !known.has(entry.name)).map((entry) => getSite(entry.name)))
+  return [...sites, ...oldSites.filter((site): site is SiteRecord => site !== null)].sort((a, b) => b.createdAt.localeCompare(a.createdAt))
 }
 
 export async function readSiteFile(name: string, requestedPath: string): Promise<{ site: SiteRecord; body: Buffer; contentType: string } | null> {
@@ -310,18 +348,40 @@ export async function renameSiteRecord(oldName: string, newName: string): Promis
   catch (error) { if (!missing(error)) throw error }
   await fs.rename(dir(oldName), dir(newName))
   site.name = newName
-  try { await writeSite(site) }
+  try {
+    const db = await database()
+    db.exec("BEGIN IMMEDIATE")
+    try {
+      db.prepare("INSERT INTO sites (name, record_json, created_at, total_bytes) VALUES (?, ?, ?, ?)").run(site.name, JSON.stringify(site), site.createdAt, site.totalBytes)
+      db.prepare("DELETE FROM sites WHERE name = ?").run(oldName)
+      db.exec("COMMIT")
+    } catch (error) {
+      db.exec("ROLLBACK")
+      throw error
+    }
+  }
   catch (error) {
     await fs.rename(dir(newName), dir(oldName)).catch(() => undefined)
     throw error
   }
+  await writeSiteSnapshot(site)
   return true
 }
 
-async function writeSite(site: SiteRecord): Promise<void> {
+async function writeSiteSnapshot(site: SiteRecord): Promise<void> {
   const temporary = metaPath(site.name) + "." + randomBytes(6).toString("hex") + ".tmp"
-  await fs.writeFile(temporary, JSON.stringify(site, null, 2), { flag: "wx" })
-  await fs.rename(temporary, metaPath(site.name))
+  try {
+    await fs.writeFile(temporary, JSON.stringify(site, null, 2), { flag: "wx" })
+    await fs.rename(temporary, metaPath(site.name))
+  } catch (error) {
+    await fs.rm(temporary, { force: true }).catch(() => undefined)
+    console.error("Site metadata snapshot failed", error)
+  }
+}
+
+async function writeSite(site: SiteRecord): Promise<void> {
+  await saveToDatabase(site)
+  await writeSiteSnapshot(site)
 }
 
 export async function setSiteDisabled(name: string, disabled: boolean): Promise<boolean> {
@@ -354,6 +414,14 @@ export async function setSiteExpiry(name: string, expiresAt: string): Promise<bo
 
 export async function purgeSite(name: string): Promise<boolean> {
   if (!await getSite(name)) return false
-  await fs.rm(dir(name), { recursive: true, force: true })
+  const hidden = path.join(ROOT, `.purging-${name}-${randomBytes(6).toString("hex")}`)
+  try { await fs.rename(dir(name), hidden) }
+  catch (error) { if (!missing(error)) throw error }
+  try { await deleteFromDatabase(name) }
+  catch (error) {
+    await fs.rename(hidden, dir(name)).catch(() => undefined)
+    throw error
+  }
+  await fs.rm(hidden, { recursive: true, force: true })
   return true
 }

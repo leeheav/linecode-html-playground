@@ -36,3 +36,5 @@ pnpm-lock.yaml
 !/.env.example
 /.next.*/
 /.deployment-backups/
+/.deployment.local.json
+/.deployment-artifacts/

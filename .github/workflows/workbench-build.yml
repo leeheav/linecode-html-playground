@@ -11,6 +11,11 @@ on:
         description: Workbench correlation ID; leave empty for a manual candidate
         required: false
         type: string
+      allow_audit_risk:
+        description: Explicitly accept known high dependency vulnerabilities for this manual candidate only
+        required: false
+        default: false
+        type: boolean
 permissions:
   contents: read
 concurrency:
@@ -42,6 +47,38 @@ jobs:
         run: npm run lint
       - name: Test
         run: npm test
+      - name: Audit production dependencies
+        env:
+          ALLOW_AUDIT_RISK: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_audit_risk }}
+        run: |
+          set +e
+          npm audit --json --omit=dev --audit-level=high --registry=https://registry.npmjs.org/ > audit-report.json
+          audit_status=$?
+          set -e
+          python3 - "$audit_status" <<'PY'
+          import json, os, pathlib, sys
+          try:
+              report = json.loads(pathlib.Path('audit-report.json').read_text())
+              if report.get('error'):
+                  raise ValueError(str(report['error']))
+              counts = report['metadata']['vulnerabilities']
+              high = int(counts['high']) + int(counts['critical'])
+          except (KeyError, ValueError, TypeError, json.JSONDecodeError) as error:
+              sys.exit(f'Audit service failed or returned invalid data: {error}')
+          status = int(sys.argv[1])
+          if status not in (0, 1):
+              sys.exit(f'Audit process failed with exit code {status}.')
+          print(f'Production dependency audit: {high} high/critical vulnerabilities')
+          if high:
+              if status != 1:
+                  sys.exit('Audit report and process status disagree.')
+              if os.environ.get('ALLOW_AUDIT_RISK', '').lower() == 'true':
+                  print('::warning::Production dependency vulnerabilities explicitly accepted for this manual candidate.')
+              else:
+                  sys.exit('High/critical vulnerabilities block candidate publishing.')
+          elif status != 0:
+              sys.exit(f'Audit process failed with exit code {status}.')
+          PY
       - name: Build and push fixed Linux image
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}

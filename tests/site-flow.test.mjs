@@ -1,11 +1,12 @@
 import assert from "node:assert/strict"
 import { spawn } from "node:child_process"
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises"
 import { createServer } from "node:net"
-import { tmpdir } from "node:os"
+import { platform, tmpdir } from "node:os"
 import path from "node:path"
 import { setTimeout as delay } from "node:timers/promises"
 import test from "node:test"
+import { DatabaseSync } from "node:sqlite"
 
 async function freePort() {
   const server = createServer()
@@ -84,8 +85,14 @@ async function startApp(t) {
   app.stdout.on("data", (chunk) => { output += String(chunk) })
   app.stderr.on("data", (chunk) => { output += String(chunk) })
   t.after(async () => {
-    app.kill()
-    await delay(500)
+    if (platform() === "win32") {
+      await new Promise((resolve) => {
+        const killer = spawn("taskkill", ["/PID", String(app.pid), "/T", "/F"], { stdio: "ignore" })
+        killer.on("error", resolve)
+        killer.on("exit", resolve)
+      })
+    } else app.kill()
+    await delay(1000)
     await rm(root, { recursive: true, force: true })
   })
   for (let attempt = 0; attempt < 120; attempt++) {
@@ -156,28 +163,55 @@ test("HTML and ZIP publishing, review, and expiry", { timeout: 180_000 }, async 
   assert.equal((await fetch(`${origin}/${review.body.name}`)).status, 404)
 
   const metaPath = path.join(root, html.body.name, "site.json")
-  const meta = JSON.parse(await readFile(metaPath, "utf8"))
+  const db = new DatabaseSync(path.join(root, "sites.db"))
+  const meta = JSON.parse(db.prepare("SELECT record_json FROM sites WHERE name = ?").get(html.body.name).record_json)
+  const update = () => db.prepare("UPDATE sites SET record_json = ? WHERE name = ?").run(JSON.stringify(meta), html.body.name)
   meta.expiresAt = new Date(Date.now() - 1000).toISOString()
-  await writeFile(metaPath, JSON.stringify(meta))
+  update()
   assert.equal((await fetch(`${origin}/${html.body.name}`)).status, 410)
   meta.status = "disabled"
   meta.expiresAt = new Date(Date.now() + 24 * 3600_000).toISOString()
   meta.disabledAt = new Date().toISOString()
-  await writeFile(metaPath, JSON.stringify(meta))
+  update()
   assert.equal((await fetch(`${origin}/${html.body.name}`)).status, 404)
 
   meta.expiresAt = new Date(Date.now() - 31 * 24 * 3600_000).toISOString()
-  await writeFile(metaPath, JSON.stringify(meta))
+  update()
   const nextSite = await create(origin, {
     kind: "html",
     html: "<html><body>Cleanup trigger</body></html>",
   })
   assert.equal(nextSite.response.status, 201)
   await assert.rejects(readFile(metaPath, "utf8"), { code: "ENOENT" })
+  assert.equal(db.prepare("SELECT name FROM sites WHERE name = ?").get(html.body.name), undefined)
+  db.close()
 
   const unsafe = await create(origin, {
     kind: "file",
     file: new File([zip([["../escape.html", "<html><body>x</body></html>"], ["index.html", "<html><body>x</body></html>"]])], "unsafe.zip"),
   })
   assert.equal(unsafe.response.status, 400)
+})
+
+test("legacy site.json migration is idempotent and preserves database edits", { timeout: 30_000 }, async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "linecode-db-migration-"))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const name = "legacy-site"
+  await mkdir(path.join(root, name))
+  const site = { schemaVersion: 2, name, status: "active", inputType: "html", createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 3600_000).toISOString(), files: ["index.html"], totalBytes: 16, scan: { result: "passed", findings: [] } }
+  await writeFile(path.join(root, name, "site.json"), JSON.stringify(site))
+  const script = path.join(process.cwd(), "scripts", "migrate-site-db.mjs")
+  const run = () => new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [script], { env: { ...process.env, SITES_DIR: root, SITE_DB_PATH: path.join(root, "sites.db") } })
+    child.on("error", reject)
+    child.on("exit", (code) => code === 0 ? resolve() : reject(new Error(`migration exited ${code}`)))
+  })
+  await run()
+  const db = new DatabaseSync(path.join(root, "sites.db"))
+  assert.equal(JSON.parse(db.prepare("SELECT record_json FROM sites WHERE name = ?").get(name).record_json).status, "active")
+  site.status = "disabled"
+  db.prepare("UPDATE sites SET record_json = ? WHERE name = ?").run(JSON.stringify(site), name)
+  await run()
+  assert.equal(JSON.parse(db.prepare("SELECT record_json FROM sites WHERE name = ?").get(name).record_json).status, "disabled")
+  db.close()
 })

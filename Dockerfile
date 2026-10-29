@@ -29,7 +29,8 @@ ENV NODE_ENV=production \
     PORT=3001 \
     HOME=/tmp \
     XDG_CACHE_HOME=/tmp/.cache \
-    SITES_DIR=/data/sites
+    SITES_DIR=/data/sites \
+    SITE_DB_PATH=/data/sites/sites.db
 RUN groupadd --gid 10001 nextjs \
     && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin nextjs \
     && mkdir -p /data/sites \
@@ -37,6 +38,7 @@ RUN groupadd --gid 10001 nextjs \
 COPY --from=builder --chown=10001:10001 /app/.next/standalone ./
 COPY --from=builder --chown=10001:10001 /app/.next/static ./.next/static
 COPY --from=builder --chown=10001:10001 /app/public ./public
+COPY --from=builder --chown=10001:10001 /app/scripts/migrate-site-db.mjs ./scripts/migrate-site-db.mjs
 # 每个候选容器使用自己的临时缓存，不与其他版本共享 Next.js 缓存。
 RUN rm -rf /app/.next/cache \
     && ln -s /tmp/next-cache /app/.next/cache

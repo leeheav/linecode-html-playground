@@ -2,11 +2,15 @@
   "name": "my-v0-project",
   "version": "0.1.0",
   "private": true,
+  "engines": {
+    "node": ">=22.13.0"
+  },
   "scripts": {
     "dev": "next dev -p 3001",
     "build": "next build",
     "start": "next start -p 3001",
     "migrate:sites": "node scripts/migrate-sites.mjs",
+    "migrate:db": "node scripts/migrate-site-db.mjs",
     "typecheck": "tsc --noEmit",
     "test": "node --test tests/site-flow.test.mjs",
     "lint": "eslint app components hooks lib scripts --max-warnings=0"

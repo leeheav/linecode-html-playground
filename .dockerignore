@@ -11,6 +11,8 @@ coverage
 test-results
 playwright-report
 .deployment-backups
+.deployment.local.json
+.deployment-artifacts
 .env
 .env.*
 !.env.example
