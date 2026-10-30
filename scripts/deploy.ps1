@@ -7,7 +7,7 @@
   pwsh -File scripts/deploy.ps1 -Action Check
 #>
 param(
-    [ValidateSet('Menu', 'Init', 'Check', 'Deploy', 'Backup', 'Rollback', 'Health', 'Workbench')]
+    [ValidateSet('Menu', 'Init', 'Check', 'Deploy', 'Backup', 'Rollback', 'Health', 'Workbench', 'Update', 'VerifyDR')]
     [string]$Action = 'Menu',
     [switch]$AllowAuditRisk
 )
@@ -79,7 +79,8 @@ function Initialize {
     $port = Read-Default '本机 Docker 监听端口' '3001'
     $container = Read-Default 'Docker 容器名' 'linecode-html-playground'
     $volume = Read-Default 'Docker 数据卷名（宿主目录留空时使用）' 'linecode-html-playground-data'
-    $hostDataPath = (Read-Host '宿主机数据目录绝对路径（留空使用 Docker 命名卷）').Trim()
+    $defaultHostData = Join-Path $projectRoot 'data\sites'
+    $hostDataPath = (Read-Default '宿主机本地映射数据目录（映射至容器 /data/sites）' $defaultHostData).Trim()
     $admin = Read-Default '管理员用户名' 'admin'
     $cfg = [pscustomobject]@{ AppUrl = $app.TrimEnd('/'); SiteUrl = $site.TrimEnd('/'); Port = [int]$port; ContainerName = $container; VolumeName = $volume; HostDataPath = $hostDataPath; ImagePrefix = 'linecode-html-playground' }
     Validate-Config $cfg
@@ -357,6 +358,103 @@ function Backup-Running($cfg) {
     try { Backup-Volume $cfg | Out-Null }
     finally { if ($wasRunning) { Run docker @('start', $cfg.ContainerName) } }
 }
+function Update-From-GitHub {
+    Say '>>> 从 GitHub 检查并拉取最新代码...'
+    Need git
+    $branch = (& git branch --show-current).Trim()
+    if (-not $branch) { $branch = 'main' }
+    $dirty = @(& git status --porcelain)
+    if ($dirty.Count -gt 0) { throw '工作区有未提交的改动，请先提交或保存后再更新。' }
+    Say "正在从 GitHub origin/$branch 快进拉取..."
+    Run git @('fetch', '--prune', 'origin', $branch)
+    Run git @('merge', '--ff-only', "origin/$branch")
+    Say "已成功从 GitHub 更新至最新提交："
+    & git log -1 --oneline
+    Say "开始执行镜像重新构建与热切部署..."
+    Deploy-Docker
+}
+
+function Verify-DR {
+    Say '=== 灾备数据包非破坏性完整性校验 ==='
+    if (-not (Test-Path -LiteralPath $backupDir -PathType Container)) {
+        throw "备份目录不存在：$backupDir"
+    }
+    $archives = @(Get-ChildItem -LiteralPath $backupDir -Filter '*.tar.gz' | Sort-Object LastWriteTime -Descending)
+    if ($archives.Count -eq 0) {
+        throw "在备份目录中未找到任何 .tar.gz 备份包：$backupDir"
+    }
+    Say "可用灾备包："
+    for ($i = 0; $i -lt $archives.Count; $i++) {
+        $mb = [math]::Round($archives[$i].Length / 1MB, 2)
+        Write-Host "  [$($i+1)] $($archives[$i].Name) ($mb MB, $($archives[$i].LastWriteTime))"
+    }
+    Write-Host "  [A] 全部校验"
+    $choice = Read-Host "请选择要校验的灾备包 [1-$($archives.Count) 或 A]"
+    $targets = @()
+    if ($choice -match '^[aA]$') { $targets = $archives }
+    elseif ($choice -match '^\d+$' -and [int]$choice -ge 1 -and [int]$choice -le $archives.Count) {
+        $targets = @($archives[[int]$choice - 1])
+    } else { throw '无效选择。' }
+
+    $passed = 0
+    $failed = 0
+    foreach ($target in $targets) {
+        Say "`n>>> 正在校验灾备包: $($target.Name)"
+        $fail = $false
+        # 1. 检查 sha256 文件
+        $shaFile = "$($target.FullName).sha256"
+        if (Test-Path -LiteralPath $shaFile) {
+            $expected = (Get-Content -LiteralPath $shaFile -Raw).Split()[0].Trim()
+            $actual = (Get-FileHash -LiteralPath $target.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($expected.ToLowerInvariant() -eq $actual) {
+                Write-Host "  [√] SHA-256 校验和：匹配 ($actual)" -ForegroundColor Green
+            } else {
+                Warn "  [X] SHA-256 校验和不匹配！期望: $expected, 实际: $actual"
+                $fail = $true
+            }
+        } else {
+            Write-Host "  [i] 未检测到配套 .sha256 校验文件（跳过校验和比对）"
+        }
+
+        # 2. 调用 python 检查 tar 安全性
+        try {
+            $pyScript = """
+import sys, tarfile, pathlib
+with tarfile.open(sys.argv[1], 'r:gz') as tar:
+    for m in tar:
+        p = pathlib.PurePosixPath(m.name)
+        if m.name.startswith('/') or '\\' in m.name or '..' in p.parts:
+            sys.exit(2)
+sys.exit(0)
+"""
+            $tempPy = [System.IO.Path]::GetTempFileName() + '.py'
+            Save-Utf8 $tempPy $pyScript
+            & python $tempPy $target.FullName
+            Remove-Item $tempPy -Force -ErrorAction SilentlyContinue
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "  [√] 压缩包结构：安全合规（无路径穿越或软链接）" -ForegroundColor Green
+            } else {
+                Warn "  [X] 压缩包包含非法穿越路径！"
+                $fail = $true
+            }
+        } catch {
+            Warn "  [X] 压缩包格式检验异常：$($_.Exception.Message)"
+            $fail = $true
+        }
+
+        if (-not $fail) {
+            Write-Host "  >>> 结论：灾备包 [$($target.Name)] 完整可用！" -ForegroundColor Green
+            $passed++
+        } else {
+            Warn "  >>> 结论：灾备包 [$($target.Name)] 校验未通过！"
+            $failed++
+        }
+    }
+    Say "`n=== 灾备校验统计 ==="
+    Write-Host "总数: $($targets.Count) | 通过: $passed | 异常: $failed"
+    if ($failed -gt 0) { throw "发现 $failed 个损坏或不安全的灾备包！" }
+}
+
 function Main([string]$name) {
     switch ($name) {
         Init { Initialize }
@@ -366,6 +464,8 @@ function Main([string]$name) {
         Rollback { Rollback-Docker }
         Health { $cfg = Load-Config; Validate-Config $cfg; Check-Health "http://127.0.0.1:$($cfg.Port)" }
         Workbench { Trigger-Workbench }
+        Update { Update-From-GitHub }
+        VerifyDR { Verify-DR }
     }
 }
 
@@ -374,9 +474,14 @@ try {
         while ($true) {
             Say '站点分享服务部署助手'
             Write-Host '1 首次配置  2 检查代码与安全  3 Docker 首次部署/更新  4 备份数据卷'
-            Write-Host '5 回滚镜像  6 健康检查  7 触发工作台候选构建  0 退出'
+            Write-Host '5 回滚镜像  6 健康检查  7 触发工作台候选构建  8 灾备完整性校验'
+            Write-Host '9 从 GitHub 拉取更新  0 退出'
             $choice = Read-Host '请选择'
-            $selected = switch ($choice) { '1' { 'Init' } '2' { 'Check' } '3' { 'Deploy' } '4' { 'Backup' } '5' { 'Rollback' } '6' { 'Health' } '7' { 'Workbench' } '0' { return } default { $null } }
+            $selected = switch ($choice) {
+                '1' { 'Init' } '2' { 'Check' } '3' { 'Deploy' } '4' { 'Backup' }
+                '5' { 'Rollback' } '6' { 'Health' } '7' { 'Workbench' }
+                '8' { 'VerifyDR' } '9' { 'Update' } '0' { return } default { $null }
+            }
             if (-not $selected) { Warn '无效选项。'; continue }
             try { Main $selected } catch { Write-Host "失败：$($_.Exception.Message)" -ForegroundColor Red }
         }

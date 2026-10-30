@@ -31,7 +31,7 @@ export async function POST(request: NextRequest) {
   if (length > MAX_REQUEST_BYTES) return NextResponse.json({ error: "请求超过 11 MB" }, { status: 413 })
 
   const client = request.headers.get("x-real-ip") || request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "unknown"
-  if (!checkCreateRateLimit(client)) return NextResponse.json({ error: "创建过于频繁，请稍后再试" }, { status: 429 })
+  if (!(await checkCreateRateLimit(client))) return NextResponse.json({ error: "创建过于频繁，请稍后再试" }, { status: 429 })
 
   try {
     publicSiteUrl("configuration-check")

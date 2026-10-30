@@ -9,7 +9,28 @@ await mkdir(path.dirname(dbPath), { recursive: true })
 
 const db = new DatabaseSync(dbPath)
 try {
-  db.exec("PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; CREATE TABLE IF NOT EXISTS sites (name TEXT PRIMARY KEY, record_json TEXT NOT NULL, created_at TEXT NOT NULL, total_bytes INTEGER NOT NULL) STRICT;")
+  db.exec(`
+    PRAGMA busy_timeout = 5000;
+    PRAGMA journal_mode = WAL;
+    CREATE TABLE IF NOT EXISTS sites (
+      name TEXT PRIMARY KEY,
+      record_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      total_bytes INTEGER NOT NULL
+    ) STRICT;
+    CREATE TABLE IF NOT EXISTS create_rate_limits (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      client TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_create_rate_limits_client_time ON create_rate_limits(client, created_at);
+    CREATE TABLE IF NOT EXISTS admin_login_attempts (
+      client TEXT PRIMARY KEY,
+      failures INTEGER NOT NULL,
+      first_failure_at INTEGER NOT NULL,
+      blocked_until INTEGER NOT NULL
+    );
+  `)
   const insert = db.prepare("INSERT OR IGNORE INTO sites (name, record_json, created_at, total_bytes) VALUES (?, ?, ?, ?)")
   let imported = 0
   let existing = 0

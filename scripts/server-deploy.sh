@@ -43,6 +43,7 @@ validate_config() {
   [[ "$TLS_MODE" == existing || "$TLS_MODE" == selfsigned ]] || die 'TLS 模式错误。'
   [[ "$CERT_FILE" =~ ^/[a-zA-Z0-9_./-]+$ && "$KEY_FILE" =~ ^/[a-zA-Z0-9_./-]+$ ]] || die '证书和私钥路径必须是安全的绝对路径。'
   [[ "$GIT_BRANCH" =~ ^[a-zA-Z0-9._/-]+$ && "$GIT_BRANCH" != -* && "$GIT_BRANCH" != *..* ]] || die 'Git 分支名称格式错误。'
+  [[ -z "$GIT_REPO_URL" || "$GIT_REPO_URL" =~ ^(https://|git@)[a-zA-Z0-9_.:/-]+ ]] || die 'Git 仓库地址格式错误（支持 HTTPS/SSH GitHub 地址）。'
 }
 load_config() {
   [[ -f "$CONFIG_FILE" && -f "$ENV_FILE" ]] || die '尚未初始化。请先运行菜单 1。'
@@ -51,16 +52,20 @@ load_config() {
   # 仅读取固定键；配置文件内容绝不作为 shell 指令执行。
   [[ "$(stat -c %u "$CONFIG_FILE")" == 0 && "$(stat -c %a "$CONFIG_FILE")" =~ ^(600|400)$ ]] || die '部署配置所有者或权限不安全。'
   local key value
-  APP_DOMAIN=''; SITE_DOMAIN=''; DATA_DIR=''; BACKUP_DIR=''; TLS_MODE=''; CERT_FILE=''; KEY_FILE=''; GIT_BRANCH=''
+  APP_DOMAIN=''; SITE_DOMAIN=''; DATA_DIR=''; BACKUP_DIR=''; TLS_MODE=''; CERT_FILE=''; KEY_FILE=''; GIT_BRANCH=''; GIT_REPO_URL=''
   while IFS='=' read -r key value; do
     case "$key" in
       APP_DOMAIN) APP_DOMAIN="$value";; SITE_DOMAIN) SITE_DOMAIN="$value";;
       DATA_DIR) DATA_DIR="$value";; BACKUP_DIR) BACKUP_DIR="$value";;
       TLS_MODE) TLS_MODE="$value";; CERT_FILE) CERT_FILE="$value";;
       KEY_FILE) KEY_FILE="$value";; GIT_BRANCH) GIT_BRANCH="$value";;
+      GIT_REPO_URL) GIT_REPO_URL="$value";;
       '') ;; *) die "部署配置包含未知字段：$key";;
     esac
   done < "$CONFIG_FILE"
+  if [[ -z "$GIT_REPO_URL" && -d "$PROJECT_DIR/.git" ]]; then
+    GIT_REPO_URL="$(git -C "$PROJECT_DIR" remote get-url origin 2>/dev/null || true)"
+  fi
   validate_config
 }
 preflight() {
@@ -76,8 +81,8 @@ write_config() {
   local tmp; tmp="$(mktemp "$STATE_DIR/config.XXXXXX")"
   chmod 600 "$tmp"
   {
-    printf 'APP_DOMAIN=%s\nSITE_DOMAIN=%s\nDATA_DIR=%s\nBACKUP_DIR=%s\nTLS_MODE=%s\nCERT_FILE=%s\nKEY_FILE=%s\nGIT_BRANCH=%s\n' \
-      "$APP_DOMAIN" "$SITE_DOMAIN" "$DATA_DIR" "$BACKUP_DIR" "$TLS_MODE" "$CERT_FILE" "$KEY_FILE" "$GIT_BRANCH"
+    printf 'APP_DOMAIN=%s\nSITE_DOMAIN=%s\nDATA_DIR=%s\nBACKUP_DIR=%s\nTLS_MODE=%s\nCERT_FILE=%s\nKEY_FILE=%s\nGIT_BRANCH=%s\nGIT_REPO_URL=%s\n' \
+      "$APP_DOMAIN" "$SITE_DOMAIN" "$DATA_DIR" "$BACKUP_DIR" "$TLS_MODE" "$CERT_FILE" "$KEY_FILE" "$GIT_BRANCH" "$GIT_REPO_URL"
   } > "$tmp"
   mv -f -- "$tmp" "$CONFIG_FILE"
 }
@@ -101,7 +106,16 @@ prepare_storage() {
   if [[ -z "$(ls -A "$DATA_DIR")" ]]; then chown 10001:10001 "$DATA_DIR"; fi
   docker run --rm --network none --user 10001:10001 --read-only \
     --mount "type=bind,src=$DATA_DIR,dst=/data/sites" alpine:3.21 \
-    sh -c 'test -w /data/sites' >/dev/null || die '容器 UID 10001 无法写入数据目录。'
+    sh -c 'test -w /data/sites' >/dev/null || die '容器 UID 10001 无法写入宿主机本地映射数据目录。'
+  say "========================================================="
+  say " 宿主机本地映射目录检查 (Host Directory Mapping):"
+  say "   [宿主机] 本地数据目录: $DATA_DIR"
+  say "   [容器内] 挂载目标路径: /data/sites"
+  say "   [持久化] SQLite 数据库: $DATA_DIR/sites.db"
+  say "   [持久化] 站点静态文件: $DATA_DIR/<site-name>/*"
+  say "   已验证容器 UID 10001:10001 具备读写权限；"
+  say "   容器销毁/升级/重建时，数据仍完好保存在宿主机本地目录中。"
+  say "========================================================="
 }
 prepare_tls() {
   if [[ "$TLS_MODE" == existing ]]; then
@@ -320,10 +334,29 @@ deploy_new() {
 git_update() {
   load_config; need git
   [[ -d "$PROJECT_DIR/.git" ]] || die '项目目录不是 Git 工作区。'
+  say ">>> 同步与检查 GitHub 远程代码..."
+  if [[ -n "$GIT_REPO_URL" ]]; then
+    local current_remote
+    current_remote="$(git -C "$PROJECT_DIR" remote get-url origin 2>/dev/null || true)"
+    if [[ "$current_remote" != "$GIT_REPO_URL" ]]; then
+      if git -C "$PROJECT_DIR" remote | grep -qx origin; then
+        git -C "$PROJECT_DIR" remote set-url origin "$GIT_REPO_URL"
+      else
+        git -C "$PROJECT_DIR" remote add origin "$GIT_REPO_URL"
+      fi
+      say "已配置 Git 远程仓库 origin -> $GIT_REPO_URL"
+    fi
+  fi
   [[ -z "$(git -C "$PROJECT_DIR" status --porcelain)" ]] || die '工作区有未提交改动，拒绝更新。'
-  [[ "$(git -C "$PROJECT_DIR" branch --show-current)" == "$GIT_BRANCH" ]] || die "当前分支必须是 $GIT_BRANCH。"
+  local current_branch
+  current_branch="$(git -C "$PROJECT_DIR" branch --show-current 2>/dev/null || true)"
+  if [[ -n "$current_branch" && "$current_branch" != "$GIT_BRANCH" ]]; then
+    git -C "$PROJECT_DIR" checkout "$GIT_BRANCH" || die "无法切换到分支 $GIT_BRANCH。"
+  fi
+  say "正在从 GitHub 拉取分支 $GIT_BRANCH 最新代码..."
   git -C "$PROJECT_DIR" fetch --prune origin "$GIT_BRANCH"
   git -C "$PROJECT_DIR" merge --ff-only "origin/$GIT_BRANCH" || die '无法快进更新，请手工处理分支。'
+  say "成功拉取 GitHub 最新提交：$(git -C "$PROJECT_DIR" log -1 --oneline)"
   deploy_new
 }
 security_check() {
@@ -362,6 +395,152 @@ audit_dependencies_check() {
   if [[ "$rc" == 1 ]]; then warn '官方 npm 审计发现高危或严重漏洞。'
   elif [[ "$rc" != 0 ]]; then warn "官方 npm 审计不可用（退出码 $rc）。"; fi
 }
+verify_archive_integrity() {
+  local target_file="$1"
+  say ">>> 校验灾备包安全性与完整性: $(basename "$target_file")"
+
+  # 1. 基础文件属性与符号链接
+  [[ ! -L "$target_file" && -f "$target_file" ]] || { warn "备份文件是符号链接或非普通文件。"; return 1; }
+
+  # 2. SHA-256 校验和检验
+  if [[ ! -f "$target_file.sha256" || -L "$target_file.sha256" ]]; then
+    warn "缺少对应的 .sha256 校验和文件: $target_file.sha256"
+    return 1
+  fi
+  if ! (cd "$(dirname "$target_file")" && sha256sum -c "$(basename "$target_file.sha256")" >/dev/null 2>&1); then
+    warn "SHA-256 校验和不匹配（数据包损坏或被篡改）"
+    return 1
+  fi
+  printf '  [√] SHA-256 校验和：匹配一致\n'
+
+  # 3. 压缩包目录穿越与安全条目检验
+  if ! python3 - "$target_file" <<'PY'
+import pathlib, sys, tarfile
+try:
+    with tarfile.open(sys.argv[1], "r:gz") as archive:
+        for item in archive:
+            name = item.name
+            path = pathlib.PurePosixPath(name)
+            if (name.startswith("/") or "\\" in name or ".." in path.parts
+                    or not (item.isfile() or item.isdir())):
+                sys.exit(2)
+    sys.exit(0)
+except Exception:
+    sys.exit(3)
+PY
+  then
+    warn "Tar 压缩包包含恶意路径穿越或非安全条目。"
+    return 1
+  fi
+  printf '  [√] Tar 压缩包结构：安全合规（无路径穿越或软链接）\n'
+
+  # 4. 沙箱解压并深度校验 SQLite 数据库与站点元数据
+  local sandbox
+  sandbox="$(mktemp -d "/tmp/.linecode-verify-dr.XXXXXX")"
+  if ! tar -C "$sandbox" -xzf "$target_file" 2>/dev/null; then
+    warn "解压到沙箱环境失败。"
+    rm -rf -- "$sandbox"
+    return 1
+  fi
+
+  local db_file="$sandbox/sites.db"
+  if [[ ! -f "$db_file" ]]; then
+    warn "备份包中缺少核心数据库 sites.db！"
+    rm -rf -- "$sandbox"
+    return 1
+  fi
+
+  local db_check
+  db_check="$(python3 - "$db_file" <<'PY'
+import sqlite3, sys
+try:
+    conn = sqlite3.connect(sys.argv[1])
+    cursor = conn.cursor()
+    integrity = cursor.execute("PRAGMA integrity_check").fetchone()[0]
+    if integrity != "ok":
+        print(f"integrity_failed:{integrity}")
+        sys.exit(1)
+    tables = set(row[0] for row in cursor.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall())
+    site_count = cursor.execute("SELECT count(*) FROM sites").fetchone()[0] if "sites" in tables else -1
+    has_rate_limits = "create_rate_limits" in tables
+    has_admin_attempts = "admin_login_attempts" in tables
+    conn.close()
+    print(f"ok:{site_count}:{has_rate_limits}:{has_admin_attempts}")
+except Exception as e:
+    print(f"error:{e}")
+    sys.exit(1)
+PY
+)" || db_check="failed"
+
+  if [[ "$db_check" =~ ^ok:([0-9]+):(True|False):(True|False)$ ]]; then
+    local scount="${BASH_REMATCH[1]}"
+    local has_rl="${BASH_REMATCH[2]}"
+    local has_adm="${BASH_REMATCH[3]}"
+    printf '  [√] SQLite 数据库完整性：PRAGMA integrity_check = ok\n'
+    printf '  [√] 站点记录总数：%s 个有效记录\n' "$scount"
+    printf '  [√] 频控与防护表：create_rate_limits=%s, admin_login_attempts=%s\n' "$has_rl" "$has_adm"
+  else
+    warn "SQLite 数据库完整性检查失败：$db_check"
+    rm -rf -- "$sandbox"
+    return 1
+  fi
+
+  local site_dirs
+  site_dirs="$(find "$sandbox" -mindepth 1 -maxdepth 1 -type d ! -name '.*' | wc -l)"
+  printf '  [√] 站点数据目录数量：%s 个目录\n' "$site_dirs"
+  rm -rf -- "$sandbox"
+  return 0
+}
+verify_disaster_recovery() {
+  root_only; load_config; need tar; need sha256sum; need python3
+  say "========================================================="
+  say " 灾备数据包完整性非破坏性校验 (Disaster Recovery Verification)"
+  say " 提示：本校验在隔离临时目录中只读检验，不会停止正在运行的服务，"
+  say " 亦不会修改线上数据目录，可在任意生产运行期间安全执行。"
+  say "========================================================="
+
+  shopt -s nullglob
+  local -a files=("$BACKUP_DIR"/linecode-*.tar.gz)
+  ((${#files[@]})) || die "备份目录 $BACKUP_DIR 中未找到备份包。"
+
+  say "可用备份包："
+  local i
+  for i in "${!files[@]}"; do
+    local fsize
+    fsize="$(du -h "${files[$i]}" | cut -f1)"
+    printf '  [%d] %s (大小: %s)\n' "$((i+1))" "$(basename "${files[$i]}")" "$fsize"
+  done
+  printf '  [A] 校验全部备份包\n'
+
+  local choice
+  read -r -p "请选择要校验的备份编号 [1-${#files[@]} 或 A]: " choice
+
+  local -a targets=()
+  if [[ "$choice" =~ ^[aA]$ ]]; then
+    targets=("${files[@]}")
+  elif [[ "$choice" =~ ^[0-9]+$ ]] && ((choice>=1 && choice<=${#files[@]})); then
+    targets=("${files[$((choice-1))]}")
+  else
+    die "无效选择。"
+  fi
+
+  local target passed=0 failed=0
+  for target in "${targets[@]}"; do
+    if verify_archive_integrity "$target"; then
+      printf '\033[32m  >>> 结论：灾备包 [%s] 完整健康，确认具备完整恢复能力！\033[0m\n\n' "$(basename "$target")"
+      ((passed++))
+    else
+      printf '\033[31m  >>> 结论：灾备包 [%s] 存在异常或损坏，请排查！\033[0m\n\n' "$(basename "$target")"
+      ((failed++))
+    fi
+  done
+
+  say "=== 灾备校验统计 ==="
+  printf '校验总数：%d | 完好合格：%d | 损坏/异常：%d\n' "${#targets[@]}" "$passed" "$failed"
+  if ((failed > 0)); then
+    die "检测到 $failed 个存在异常的灾备包，请核实灾备存储健康度！"
+  fi
+}
 restore_data() {
   root_only; load_config; need tar; need sha256sum; need python3
   say '可用备份'; local files=() file selected tmp old slot failed other
@@ -373,18 +552,11 @@ restore_data() {
   read -r -p '输入编号: ' selected
   [[ "$selected" =~ ^[0-9]+$ ]] && ((selected>=1 && selected<=${#files[@]})) || die '备份编号无效。'
   file="${files[$((selected-1))]}"
-  [[ ! -L "$file" && ! -L "$file.sha256" && -f "$file" ]] || die '备份文件不能是符号链接。'
-  [[ -f "$file.sha256" ]] && (cd "$BACKUP_DIR" && sha256sum -c "$(basename "$file.sha256")") || die '备份校验失败。'
-  python3 - "$file" <<'PY' || die '备份含有不安全条目，拒绝恢复。'
-import pathlib, sys, tarfile
-with tarfile.open(sys.argv[1], "r:gz") as archive:
-    for item in archive:
-        name = item.name
-        path = pathlib.PurePosixPath(name)
-        if (name.startswith("/") or "\\" in name or ".." in path.parts
-                or not (item.isfile() or item.isdir())):
-            raise SystemExit(f"unsafe archive member: {name}")
-PY
+
+  # 在停止服务前先执行非破坏性完整性校验，防止因为备份包损坏而停服
+  say "正在执行恢复前灾备包完整性预检..."
+  verify_archive_integrity "$file" || die "灾备包完整性预检失败，拒绝执行恢复，线上服务保持原样。"
+
   confirm "即将恢复 $file；当前数据会先备份，服务短暂停止" '确认恢复' || die '已取消。'
   tmp="$(mktemp -d "$(dirname "$DATA_DIR")/.linecode-restore.XXXXXX")"
   tar -C "$tmp" -xzf "$file" || die "解包失败，临时文件保留在 $tmp。"
@@ -473,9 +645,12 @@ init_deploy() {
   fi
   APP_DOMAIN="$(ask '应用域名（不含 https://）' 'play.linecode.top')"
   SITE_DOMAIN="$(ask '分享域名（可暂与应用相同）' "$APP_DOMAIN")"
-  DATA_DIR="$(ask 'Docker 映射的宿主机数据目录' '/srv/linecode-html-playground/data')"
-  BACKUP_DIR="$(ask '宿主机备份目录' '/srv/linecode-html-playground/backups')"
-  GIT_BRANCH="$(ask 'Git 更新分支' 'main')"
+  DATA_DIR="$(ask 'Docker 映射的宿主机本地数据目录' '/srv/linecode-html-playground/data')"
+  BACKUP_DIR="$(ask '宿主机本地备份目录' '/srv/linecode-html-playground/backups')"
+  local default_repo
+  default_repo="$(git -C "$PROJECT_DIR" remote get-url origin 2>/dev/null || echo 'https://github.com/linecode/linecode-html-playground.git')"
+  GIT_REPO_URL="$(ask 'GitHub 仓库地址（支持 https/ssh）' "$default_repo")"
+  GIT_BRANCH="$(ask 'Git 更新跟踪分支' 'main')"
   printf '[1] 使用已有正式证书  [2] 生成 30 天自签证书（仅测试）\n'
   local choice; read -r -p 'TLS 方式: ' choice
   case "$choice" in
@@ -488,32 +663,54 @@ init_deploy() {
   esac
   validate_config
   if [[ "$APP_DOMAIN" == "$SITE_DOMAIN" ]]; then warn '应用与分享内容共用域名；正式上线建议另配分享域名。'; fi
-  confirm "配置 $APP_DOMAIN、数据目录 $DATA_DIR 并首次构建部署" '确认首次部署' || die '已取消。'
+  say "========================================================="
+  say " 确认首次部署配置："
+  say "   - 应用域名:   https://$APP_DOMAIN"
+  say "   - 分享域名:   https://$SITE_DOMAIN"
+  say "   - 宿主数据目录: $DATA_DIR  (映射至容器 /data/sites)"
+  say "   - 宿主备份目录: $BACKUP_DIR"
+  say "   - GitHub 仓库: $GIT_REPO_URL (分支: $GIT_BRANCH)"
+  say "========================================================="
+  confirm "确认配置并开始首次构建部署" '确认首次部署' || die '已取消。'
   write_config; write_env; deploy_new
 }
 main() {
   case "${1:-menu}" in
     --help|-h|help)
-      printf '用法：bash scripts/server-deploy.sh [init|deploy|update|security|backup|restore|health|service|frontend|--check]\n'
-      printf '菜单 1–8 对应首次部署、Git 更新、安全检查、备份、恢复、健康、运维、整体重建。\n';;
+      printf '用法：bash scripts/server-deploy.sh [init|deploy|update|security|backup|restore|verify-dr|health|service|frontend|--check]\n'
+      printf '选项说明：\n'
+      printf '  init       首次配置、目录映射检查与完整部署\n'
+      printf '  deploy     基于当前工作区代码重新构建镜像并平滑切换\n'
+      printf '  update     从 GitHub 拉取指定分支最新代码后构建热切\n'
+      printf '  backup     全量数据一致性备份（生成 tar.gz 与 sha256）\n'
+      printf '  verify-dr  非破坏性灾备包完整性校验（校验哈希与 SQLite）\n'
+      printf '  restore    交互式容灾恢复（预检哈希、解压、数据还原）\n'
+      printf '  security   系统与文件权限安全检查及加固\n'
+      printf '  health     系统与容器运行健康体检\n'
+      printf '  service    服务运维管理（启动/停止/重启/日志/终端）\n'
+      printf '  frontend   前端重载（整体 Next.js 镜像重建与 Nginx 重载）\n'
+      printf '  --check    检查脚本语法与项目完整性（只读不影响系统）\n';;
     --check) need bash; need git; [[ -f "$PROJECT_DIR/Dockerfile" && -f "$PROJECT_DIR/package.json" ]] || die '项目目录不完整。'; bash -n "${BASH_SOURCE[0]}"; say '脚本语法和项目位置检查通过；未修改服务器。';;
     init) init_deploy;; deploy) root_only; deploy_new;; update) root_only; git_update;; security) security_check;;
-    backup) root_only; backup_data;; restore) restore_data;; health) health_check;;
+    backup) root_only; backup_data;; verify-dr) root_only; verify_disaster_recovery;; restore) restore_data;; health) health_check;;
     service) root_only; service_menu;;
     frontend) root_only; load_config; say '本项目是 Next.js 前后端一体容器，无独立 dist；执行整体镜像重建并热切换。'; deploy_new;;
     menu)
       while :; do
-        printf '\n[1] 首次完整部署  [2] 版本更新迭代  [3] 系统安全检查\n'
-        printf '[4] 全量数据备份  [5] 数据容灾恢复  [6] 系统健康体检\n'
-        printf '[7] 服务运维管理  [8] 前端静态重载（整体重建）  [0] 退出控制台\n'
+        printf '\n================== 部署与运维控制台 ==================\n'
+        printf ' [1] 首次完整部署      [2] 版本更新迭代(GitHub)  [3] 系统安全检查\n'
+        printf ' [4] 全量数据备份      [5] 数据容灾恢复          [6] 系统健康体检\n'
+        printf ' [7] 服务运维管理      [8] 前端静态重载          [9] 灾备完整性校验\n'
+        printf ' [0] 退出控制台\n'
+        printf '=======================================================\n'
         local choice; read -r -p '请选择: ' choice || return 0
         case "$choice" in
           1) main init;; 2) main update;; 3) main security;; 4) main backup;;
           5) main restore;; 6) main health;; 7) main service;; 8) main frontend;;
-          0) return 0;; *) warn '无效选项。';;
+          9) main verify-dr;; 0) return 0;; *) warn '无效选项。';;
         esac
       done;;
-    *) die '用法：bash scripts/server-deploy.sh [init|update|security|backup|restore|health|service|frontend]' ;;
+    *) die '用法：bash scripts/server-deploy.sh [init|deploy|update|security|backup|verify-dr|restore|health|service|frontend]' ;;
   esac
 }
 case "${1:-menu}" in

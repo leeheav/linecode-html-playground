@@ -80,7 +80,7 @@ export async function purgeRetainedSites(now = Date.now()): Promise<number> {
   return removed
 }
 
-export function checkCreateRateLimit(client: string): boolean {
+export function checkCreateRateLimitSyncFallback(client: string): boolean {
   const now = Date.now()
   const recent = (createAttempts.get(client) || []).filter((time) => now - time < RATE_WINDOW_MS)
   if (recent.length >= MAX_CREATES_PER_WINDOW) return false
@@ -88,6 +88,29 @@ export function checkCreateRateLimit(client: string): boolean {
   createAttempts.set(client, recent)
   if (createAttempts.size > 10000) for (const [key, times] of createAttempts) if (times.every((time) => now - time >= RATE_WINDOW_MS)) createAttempts.delete(key)
   return true
+}
+
+export async function checkCreateRateLimit(client: string): Promise<boolean> {
+  const normalizedClient = (client || "unknown").trim().slice(0, 128)
+  const now = Date.now()
+  try {
+    const db = await database()
+    db.prepare("DELETE FROM create_rate_limits WHERE created_at < ?").run(now - RATE_WINDOW_MS)
+    const result = db.prepare(
+      "SELECT COUNT(*) as count FROM create_rate_limits WHERE client = ? AND created_at >= ?"
+    ).get(normalizedClient, now - RATE_WINDOW_MS) as { count: number } | undefined
+
+    const count = result?.count ?? 0
+    if (count >= MAX_CREATES_PER_WINDOW) {
+      return false
+    }
+
+    db.prepare("INSERT INTO create_rate_limits (client, created_at) VALUES (?, ?)").run(normalizedClient, now)
+    return true
+  } catch (error) {
+    console.error("Rate limit check database error, falling back to in-memory:", error)
+    return checkCreateRateLimitSyncFallback(normalizedClient)
+  }
 }
 
 export function isValidSiteName(name: string): boolean {
@@ -109,9 +132,34 @@ async function database(): Promise<DatabaseSync> {
   if (databaseState.__linecodeSiteDatabase?.path === DB_PATH) return databaseState.__linecodeSiteDatabase.db
   await fs.mkdir(path.dirname(DB_PATH), { recursive: true })
   const db = new DatabaseSync(DB_PATH)
-  db.exec("PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; CREATE TABLE IF NOT EXISTS sites (name TEXT PRIMARY KEY, record_json TEXT NOT NULL, created_at TEXT NOT NULL, total_bytes INTEGER NOT NULL) STRICT;")
+  db.exec(`
+    PRAGMA busy_timeout = 5000;
+    PRAGMA journal_mode = WAL;
+    CREATE TABLE IF NOT EXISTS sites (
+      name TEXT PRIMARY KEY,
+      record_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      total_bytes INTEGER NOT NULL
+    ) STRICT;
+    CREATE TABLE IF NOT EXISTS create_rate_limits (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      client TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_create_rate_limits_client_time ON create_rate_limits(client, created_at);
+    CREATE TABLE IF NOT EXISTS admin_login_attempts (
+      client TEXT PRIMARY KEY,
+      failures INTEGER NOT NULL,
+      first_failure_at INTEGER NOT NULL,
+      blocked_until INTEGER NOT NULL
+    );
+  `)
   databaseState.__linecodeSiteDatabase = { path: DB_PATH, db }
   return db
+}
+
+export async function getSiteDatabase(): Promise<DatabaseSync> {
+  return database()
 }
 
 function parseSite(value: string, name: string): SiteRecord {

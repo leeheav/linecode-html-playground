@@ -1,3 +1,4 @@
+import { getSiteDatabase } from "./site-service"
 import "server-only"
 
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "crypto"
@@ -152,10 +153,14 @@ export async function isAdminAuthenticated(): Promise<boolean> {
 }
 
 async function getLoginClientKey(): Promise<string> {
-  const requestHeaders = await headers()
-  const forwardedFor = requestHeaders.get("x-forwarded-for")?.split(",")[0]?.trim()
-  const clientIp = requestHeaders.get("x-real-ip") || forwardedFor || "unknown"
-  return clientIp.slice(0, 128)
+  try {
+    const requestHeaders = await headers()
+    const forwardedFor = requestHeaders.get("x-forwarded-for")?.split(",")[0]?.trim()
+    const clientIp = requestHeaders.get("x-real-ip") || forwardedFor || "unknown"
+    return clientIp.slice(0, 128)
+  } catch {
+    return "unknown"
+  }
 }
 
 function pruneLoginAttempts(now: number): void {
@@ -170,49 +175,107 @@ function pruneLoginAttempts(now: number): void {
 
 export async function getLoginRetryAfterSeconds(): Promise<number> {
   const now = Date.now()
-  pruneLoginAttempts(now)
-
   const key = await getLoginClientKey()
-  const attempt = loginAttempts.get(key)
-  if (!attempt) return 0
 
-  if (attempt.blockedUntil > now) {
-    return Math.ceil((attempt.blockedUntil - now) / 1000)
-  }
+  try {
+    const db = await getSiteDatabase()
+    db.prepare("DELETE FROM admin_login_attempts WHERE blocked_until <= ? AND (? - first_failure_at) > ?")
+      .run(now, now, LOGIN_WINDOW_MS)
 
-  if (now - attempt.firstFailureAt > LOGIN_WINDOW_MS) {
-    loginAttempts.delete(key)
+    const row = db.prepare(
+      "SELECT failures, first_failure_at, blocked_until FROM admin_login_attempts WHERE client = ?"
+    ).get(key) as { failures: number; first_failure_at: number; blocked_until: number } | undefined
+
+    if (!row) return 0
+
+    if (row.blocked_until > now) {
+      return Math.ceil((row.blocked_until - now) / 1000)
+    }
+
+    if (now - row.first_failure_at > LOGIN_WINDOW_MS) {
+      db.prepare("DELETE FROM admin_login_attempts WHERE client = ?").run(key)
+    }
+    return 0
+  } catch (error) {
+    console.error("SQLite getLoginRetryAfterSeconds error, falling back to memory:", error)
+    pruneLoginAttempts(now)
+    const attempt = loginAttempts.get(key)
+    if (!attempt) return 0
+    if (attempt.blockedUntil > now) {
+      return Math.ceil((attempt.blockedUntil - now) / 1000)
+    }
+    if (now - attempt.firstFailureAt > LOGIN_WINDOW_MS) {
+      loginAttempts.delete(key)
+    }
+    return 0
   }
-  return 0
 }
 
 export async function recordLoginFailure(): Promise<number> {
   const now = Date.now()
   const key = await getLoginClientKey()
-  pruneLoginAttempts(now)
 
-  if (!loginAttempts.has(key) && loginAttempts.size >= 1000) {
-    const oldestKey = loginAttempts.keys().next().value
-    if (typeof oldestKey === "string") loginAttempts.delete(oldestKey)
+  try {
+    const db = await getSiteDatabase()
+    db.prepare("DELETE FROM admin_login_attempts WHERE blocked_until <= ? AND (? - first_failure_at) > ?")
+      .run(now, now, LOGIN_WINDOW_MS)
+
+    const row = db.prepare(
+      "SELECT failures, first_failure_at, blocked_until FROM admin_login_attempts WHERE client = ?"
+    ).get(key) as { failures: number; first_failure_at: number; blocked_until: number } | undefined
+
+    let failures = 1
+    let firstFailureAt = now
+    let blockedUntil = 0
+
+    if (row && now - row.first_failure_at <= LOGIN_WINDOW_MS) {
+      failures = row.failures + 1
+      firstFailureAt = row.first_failure_at
+      blockedUntil = row.blocked_until
+    }
+
+    if (failures >= MAX_LOGIN_FAILURES) {
+      blockedUntil = now + LOGIN_BLOCK_MS
+    }
+
+    db.prepare(`
+      INSERT INTO admin_login_attempts (client, failures, first_failure_at, blocked_until)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(client) DO UPDATE SET
+        failures = excluded.failures,
+        first_failure_at = excluded.first_failure_at,
+        blocked_until = excluded.blocked_until
+    `).run(key, failures, firstFailureAt, blockedUntil)
+
+    return blockedUntil > now ? Math.ceil((blockedUntil - now) / 1000) : 0
+  } catch (error) {
+    console.error("SQLite recordLoginFailure error, falling back to memory:", error)
+    pruneLoginAttempts(now)
+    if (!loginAttempts.has(key) && loginAttempts.size >= 1000) {
+      const oldestKey = loginAttempts.keys().next().value
+      if (typeof oldestKey === "string") loginAttempts.delete(oldestKey)
+    }
+    const current = loginAttempts.get(key)
+    const attempt =
+      !current || now - current.firstFailureAt > LOGIN_WINDOW_MS
+        ? { failures: 0, firstFailureAt: now, blockedUntil: 0 }
+        : current
+    attempt.failures += 1
+    if (attempt.failures >= MAX_LOGIN_FAILURES) {
+      attempt.blockedUntil = now + LOGIN_BLOCK_MS
+    }
+    loginAttempts.set(key, attempt)
+    return attempt.blockedUntil > now ? Math.ceil((attempt.blockedUntil - now) / 1000) : 0
   }
-
-  const current = loginAttempts.get(key)
-  const attempt =
-    !current || now - current.firstFailureAt > LOGIN_WINDOW_MS
-      ? { failures: 0, firstFailureAt: now, blockedUntil: 0 }
-      : current
-
-  attempt.failures += 1
-  if (attempt.failures >= MAX_LOGIN_FAILURES) {
-    attempt.blockedUntil = now + LOGIN_BLOCK_MS
-  }
-  loginAttempts.set(key, attempt)
-
-  return attempt.blockedUntil > now
-    ? Math.ceil((attempt.blockedUntil - now) / 1000)
-    : 0
 }
 
 export async function resetLoginFailures(): Promise<void> {
-  loginAttempts.delete(await getLoginClientKey())
+  const key = await getLoginClientKey()
+  try {
+    const db = await getSiteDatabase()
+    db.prepare("DELETE FROM admin_login_attempts WHERE client = ?").run(key)
+  } catch (error) {
+    console.error("SQLite resetLoginFailures error:", error)
+  }
+  loginAttempts.delete(key)
 }

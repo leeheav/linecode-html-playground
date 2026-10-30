@@ -106,10 +106,10 @@ async function startApp(t) {
   throw new Error(`Next did not become ready:\n${output}`)
 }
 
-async function create(origin, fields) {
+async function create(origin, fields, headers = {}) {
   const form = new FormData()
   for (const [key, value] of Object.entries(fields)) form.set(key, value)
-  const response = await fetch(`${origin}/api/sites`, { method: "POST", body: form })
+  const response = await fetch(`${origin}/api/sites`, { method: "POST", body: form, headers })
   return { response, body: await response.json() }
 }
 
@@ -123,6 +123,11 @@ test("HTML and ZIP publishing, review, and expiry", { timeout: 180_000 }, async 
   })
   assert.equal(html.response.status, 201)
   assert.equal(html.body.status, "active")
+
+  const activeStatus = await (await fetch(`${origin}/api/sites/${html.body.name}/status`)).json()
+  assert.equal(activeStatus.status, "active")
+  assert.equal(activeStatus.url, `${origin}/${html.body.name}`)
+
   const page = await fetch(`${origin}/${html.body.name}`)
   assert.equal(page.status, 200)
   assert.match(await page.text(), /Shared page/)
@@ -160,6 +165,11 @@ test("HTML and ZIP publishing, review, and expiry", { timeout: 180_000 }, async 
     html: "<html><body><input type='password'></body></html>",
   })
   assert.equal(review.body.status, "review")
+
+  const reviewStatus = await (await fetch(`${origin}/api/sites/${review.body.name}/status`)).json()
+  assert.equal(reviewStatus.status, "review")
+  assert.equal(reviewStatus.url, undefined)
+
   assert.equal((await fetch(`${origin}/${review.body.name}`)).status, 404)
 
   const metaPath = path.join(root, html.body.name, "site.json")
@@ -213,5 +223,47 @@ test("legacy site.json migration is idempotent and preserves database edits", { 
   db.prepare("UPDATE sites SET record_json = ? WHERE name = ?").run(JSON.stringify(site), name)
   await run()
   assert.equal(JSON.parse(db.prepare("SELECT record_json FROM sites WHERE name = ?").get(name).record_json).status, "disabled")
+  db.close()
+})
+
+
+test("rate limiting and persistent protection with sqlite", { timeout: 120_000 }, async (t) => {
+  const { origin, root } = await startApp(t)
+  const ip = "198.51.100.42"
+
+  // 创建 10 个站点达到限额
+  for (let i = 0; i < 10; i++) {
+    const res = await create(origin, {
+      kind: "html",
+      html: `<html><body><h1>Rate test ${i}</h1></body></html>`,
+    }, { "x-forwarded-for": ip })
+    assert.equal(res.response.status, 201)
+  }
+
+  // 第 11 个请求应被频控阻断 (429)
+  const blocked = await create(origin, {
+    kind: "html",
+    html: "<html><body><h1>Rate test 11</h1></body></html>",
+  }, { "x-forwarded-for": ip })
+  assert.equal(blocked.response.status, 429)
+  assert.match(blocked.body.error, /频繁/)
+
+  // 验证 SQLite 中持久化了频控记录
+  const db = new DatabaseSync(path.join(root, "sites.db"))
+  const row = db.prepare("SELECT COUNT(*) as count FROM create_rate_limits WHERE client = ?").get(ip)
+  assert.equal(row.count, 10)
+
+  // 验证不同 IP 不受阻断
+  const otherIpRes = await create(origin, {
+    kind: "html",
+    html: "<html><body><h1>Different IP</h1></body></html>",
+  }, { "x-forwarded-for": "198.51.100.99" })
+  assert.equal(otherIpRes.response.status, 201)
+
+  // 验证表 admin_login_attempts 存在且可用
+  db.prepare("INSERT INTO admin_login_attempts (client, failures, first_failure_at, blocked_until) VALUES (?, ?, ?, ?)").run("admin-test-ip", 1, Date.now(), 0)
+  const loginRow = db.prepare("SELECT failures FROM admin_login_attempts WHERE client = ?").get("admin-test-ip")
+  assert.equal(loginRow.failures, 1)
+
   db.close()
 })

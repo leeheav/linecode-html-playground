@@ -1,5 +1,7 @@
 "use server"
 
+import { headers } from "next/headers"
+
 import {
   clearAdminSession,
   createAdminSession,
@@ -38,7 +40,9 @@ export async function createSite(
 ): Promise<{ url: string; generatedName?: string; error?: string }> {
   try {
     publicSiteUrl("configuration-check")
-    if (!checkCreateRateLimit("legacy-action")) {
+    const requestHeaders = await headers()
+    const client = requestHeaders.get("x-real-ip") || requestHeaders.get("x-forwarded-for")?.split(",")[0]?.trim() || "action-client"
+    if (!(await checkCreateRateLimit(client))) {
       return { url: "", error: "创建过于频繁，请稍后重试。" }
     }
     const { site, generatedName } = await createSiteFromInput({ html, name: siteName })
